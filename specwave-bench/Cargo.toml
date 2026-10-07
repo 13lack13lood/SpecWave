@@ -1,0 +1,21 @@
+[package]
+name = "specwave-bench"
+description = "SpecWave measurements: per-layer timing, coverage with the real codec, wave calibration, end to end"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["candle"]
+# The real encoder, i.e. specwave's candle feature. It pulls in C/C++ build scripts, so cross-target checks turn it off.
+candle = ["specwave/candle"]
+
+[dependencies]
+coldivf = { workspace = true, features = ["inmem"] }
+specwave.workspace = true
+
+[[bin]]
+name = "spec"
+path = "src/bin/spec.rs"
+required-features = ["candle"]

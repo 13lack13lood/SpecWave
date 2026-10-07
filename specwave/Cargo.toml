@@ -1,0 +1,16 @@
+[package]
+name = "specwave"
+description = "Fire ColdIVF's read waves from inside the embedding model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# The candle encoder. It is off by default so cross-target checks stay pure Rust.
+# It brings in candle-core, candle-nn and tokenizers 0.22 with only the "onig" feature.
+# That feature adds a regex library with C/C++ build scripts.
+candle = []
+
+[dependencies]
+coldivf.workspace = true

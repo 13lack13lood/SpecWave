@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["specwave", "specwave-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[workspace.dependencies]
+specwave = { path = "specwave" }
+# ColdIVF lives in the sibling repo ~/vectordb/coldivf. Once both repos are on GitHub, switch this to a git
+# dependency and keep a [patch] pointing back at ../coldivf for local work.
+coldivf = { path = "../coldivf/coldivf" }
+
+[profile.release]
+debug = "line-tables-only"
+codegen-units = 1
+lto = "thin"
+
+[profile.release.package."*"]
+codegen-units = 16
