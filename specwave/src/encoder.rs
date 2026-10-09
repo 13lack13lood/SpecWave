@@ -1,12 +1,22 @@
 //! The embedding model, with a hook at chosen layers.
 //!
 //! Layer l is the state after l transformer layers, as in Hugging Face's `hidden_states[l]`. Layer 0 is the
-//! output of the embedding lookup. The first backend (feature `candle`) is a copy of candle-transformers'
-//! `bert.rs` in `encoder/bert.rs`. It calls the hook with layer 0 after the embedding lookup, and with layer i + 1
-//! after transformer layer i. It summarizes the layer on the GPU and copies back only 2d floats, where d is the
-//! embedding size. It does this only for the layers the hook wants, so a query waits for the GPU (Metal) once.
+//! output of the embedding lookup. The first backend (feature `candle`) is `CandleEncoder`, which runs a copy of
+//! candle-transformers' BERT (Bidirectional Encoder Representations from Transformers) network in `encoder/bert.rs`.
+//! It calls the hook with layer 0 after the embedding lookup, and with layer i + 1 after transformer layer i. It
+//! summarizes the layer on the device and copies back only 2d floats, where d is the embedding size. It does this
+//! only for the layers the hook wants, so on the graphics processor (GPU, through Metal) a query waits for the
+//! device once.
 
 use std::io::Error;
+
+#[cfg(feature = "candle")]
+mod bert;
+#[cfg(feature = "candle")]
+mod candle;
+
+#[cfg(feature = "candle")]
+pub use self::candle::{Backend, CandleEncoder, Pooling, snapshot_dir};
 
 /// Called on the encoder's thread. It must return quickly.
 pub trait LayerHook {
@@ -25,3 +35,18 @@ pub trait LayerEncoder {
     /// The arctic-embed-m model uses the CLS token with a query prefix, and MiniLM uses the average over the tokens.
     fn encode(&mut self, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error>;
 }
+
+/// A hook that wants no layer, for queries that don't speculate.
+pub struct NoHook;
+
+impl LayerHook for NoHook {
+    fn wants(&self, _layer: usize) -> bool {
+        false
+    }
+
+    fn on_layer(&mut self, _layer: usize, _pooled: &[f32]) {}
+}
+
+#[cfg(all(test, feature = "candle"))]
+#[path = "../tests/unit/encoder/testutil.rs"]
+mod testutil;

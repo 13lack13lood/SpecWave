@@ -14,8 +14,27 @@ candle = ["specwave/candle"]
 [dependencies]
 coldivf = { workspace = true, features = ["inmem"] }
 specwave.workspace = true
+# bytemuck: reads the mapped vector files as f32 and u32 values after checking their alignment and length.
+bytemuck = "1.25.2"
+# memmap2: maps the vector files, so a build reads the documents without loading them.
+memmap2 = "0.9.11"
+# serde_json: reads the query texts, the layer timings and the coverage results back from their JSON-lines files.
+serde_json = "1.0.151"
+
+[dev-dependencies]
+# The tests also read ColdIVF's trace of each search, which shows the rows that a search's last read wave fetched.
+coldivf = { workspace = true, features = ["inmem", "bench"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# libc: pthread_set_qos_class_self_np, so the layer timing runs at the user-interactive quality of service.
+libc = "0.2.190"
 
 [[bin]]
 name = "spec"
 path = "src/bin/spec.rs"
+required-features = ["candle"]
+
+[[bin]]
+name = "layers"
+path = "src/bin/layers.rs"
 required-features = ["candle"]
