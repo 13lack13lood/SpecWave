@@ -1,6 +1,8 @@
-//! Small random data in clusters, and the files that hold it, for the unit tests.
+//! Small random data in clusters, the files that hold it, and a lock for the tests that drop files from the cache.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use coldivf::{Clusters, VectorSource};
 
@@ -185,4 +187,12 @@ pub(crate) fn write_table<T: Copy>(path: &Path, width: usize, values: &[T], bits
     bytes.extend((width as i32).to_le_bytes());
     values.iter().for_each(|&v| bytes.extend(bits(v).to_le_bytes()));
     std::fs::write(path, bytes).unwrap();
+}
+
+/// A lock that each test which drops files from the system's cache holds while it runs. Such tests read, map and drop
+/// files, and something may read a file back into the cache soon after one of those, so they run one at a time.
+#[cfg(target_os = "macos")]
+pub(crate) fn cold() -> MutexGuard<'static, ()> {
+    static COLD: Mutex<()> = Mutex::new(());
+    COLD.lock().unwrap_or_else(PoisonError::into_inner)
 }

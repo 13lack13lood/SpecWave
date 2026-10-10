@@ -20,7 +20,8 @@ pub use self::candle::{Backend, CandleEncoder, Pooling, snapshot_dir};
 
 /// Called on the encoder's thread. It must return quickly.
 pub trait LayerHook {
-    /// Whether `on_layer` wants this layer.
+    /// Whether `on_layer` wants this layer. The encoder asks once per layer, in order, as soon as the layer is done.
+    /// On a device that queues its work, that is as soon as the layer's work is queued.
     fn wants(&self, layer: usize) -> bool;
     /// `pooled` is the layer's summary of 2d values, the average over the tokens followed by the first token's state.
     /// BERT-style models put a summary token there, the classification (CLS) token.
@@ -34,6 +35,11 @@ pub trait LayerEncoder {
     /// Runs the model on `text` and calls `hook` at the layers it wants. It returns the final normalized embedding.
     /// The arctic-embed-m model uses the CLS token with a query prefix, and MiniLM uses the average over the tokens.
     fn encode(&mut self, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error>;
+    /// Whether the device queues the model's work and runs it later, eg. the GPU through Metal, rather than running
+    /// each step as it is issued, as the processor does. The hook then hears of a layer before the layer has run.
+    fn queues_work(&self) -> bool {
+        false
+    }
 }
 
 /// A hook that wants no layer, for queries that don't speculate.

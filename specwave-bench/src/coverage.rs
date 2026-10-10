@@ -218,11 +218,10 @@ pub fn base_nprobe(fraction: f64, nlist: usize) -> usize {
     ((fraction * nlist as f64).round() as usize).clamp(1, nlist.max(1))
 }
 
-/// The clusters that a guess reads for a base `nprobe`, ⌊(1 + beta)·nprobe⌋, at most `nlist`. Rounding down keeps the
-/// share of extra clusters within `beta`. The floor allows for the rounding error of the product, so eg. 1.15·20 gives
-/// 23.
+/// The clusters that a guess reads for a base `nprobe`, ⌊(1 + beta)·nprobe⌋ as SpecWave's worker reads them, at most
+/// `nlist`.
 pub fn wide_nprobe(nprobe: usize, beta: f64, nlist: usize) -> usize {
-    (((1.0 + beta) * nprobe as f64 + 1e-9).floor() as usize).min(nlist)
+    specwave::speculate::wide_nprobe(nprobe, beta).min(nlist)
 }
 
 /// The share of extra clusters that reading `wide` clusters adds to a base `nprobe`, wide/nprobe − 1.

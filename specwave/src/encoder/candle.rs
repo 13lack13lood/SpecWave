@@ -52,6 +52,8 @@ pub struct CandleEncoder {
     pooling: Pooling,
     dim: usize,
     layers: usize,
+    /// The model's positions, the most tokens it can read.
+    positions: usize,
 }
 
 impl CandleEncoder {
@@ -98,7 +100,29 @@ impl CandleEncoder {
             pooling: settings.pooling,
             dim: config.hidden_size,
             layers: config.num_hidden_layers,
+            positions: config.max_position_embeddings,
         })
+    }
+
+    /// Cuts every text at `max` tokens, counting the prompt and the special tokens, or at the model's last position if
+    /// that comes first. Until this is called the snapshot's own limit holds, eg. 512 tokens for arctic-embed-m. A
+    /// limit that leaves no room for the text gives `InvalidInput`.
+    pub fn set_max_tokens(&mut self, max: usize) -> Result<(), Error> {
+        let max = max.min(self.positions);
+
+        if max <= special_tokens(&self.tokenizer) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "the limit leaves no room for the text",
+            ));
+        }
+
+        truncate(&mut self.tokenizer, max).map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))
+    }
+
+    /// The most tokens a text is cut to, counting the prompt and the special tokens.
+    pub fn max_tokens(&self) -> usize {
+        self.tokenizer.get_truncation().map_or(self.positions, |t| t.max_length)
     }
 
     /// The text put in front of every query, eg. "Represent this sentence for searching relevant passages: ".
@@ -180,6 +204,10 @@ impl LayerEncoder for CandleEncoder {
         let scale = (1.0 / norm.max(1e-12)) as f32;
         embedding.iter_mut().for_each(|x| *x *= scale);
         Ok(embedding)
+    }
+
+    fn queues_work(&self) -> bool {
+        self.device.is_metal()
     }
 }
 
@@ -332,20 +360,28 @@ impl Settings {
 fn read_tokenizer(path: &Path, max_len: usize) -> Result<Tokenizer, Error> {
     let bytes = std::fs::read(path)?;
     let mut tokenizer = Tokenizer::from_bytes(&bytes).map_err(|e| damaged(format!("tokenizer.json: {e}")))?;
-    let special = tokenizer.get_post_processor().map_or(0, |p| p.added_tokens(false));
 
-    if max_len <= special {
+    if max_len <= special_tokens(&tokenizer) {
         return Err(damaged("the longest input leaves no room for the text"));
     }
 
     tokenizer.with_padding(None);
-    tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length: max_len,
-            ..TruncationParams::default()
-        }))
-        .map_err(|e| damaged(format!("tokenizer.json: {e}")))?;
+    truncate(&mut tokenizer, max_len).map_err(|e| damaged(format!("tokenizer.json: {e}")))?;
     Ok(tokenizer)
+}
+
+/// The special tokens the tokenizer adds to a text, eg. 2 for the classification token and the separator.
+fn special_tokens(tokenizer: &Tokenizer) -> usize {
+    tokenizer.get_post_processor().map_or(0, |p| p.added_tokens(false))
+}
+
+/// Sets the tokenizer to cut texts at `max_len` tokens, which must be more than its special tokens.
+fn truncate(tokenizer: &mut Tokenizer, max_len: usize) -> Result<(), tokenizers::Error> {
+    tokenizer.with_truncation(Some(TruncationParams {
+        max_length: max_len,
+        ..TruncationParams::default()
+    }))?;
+    Ok(())
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, Error> {

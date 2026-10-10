@@ -10,20 +10,35 @@ publish.workspace = true
 # The candle encoder. It is off by default so cross-target checks stay pure Rust.
 # It brings in candle-core, candle-nn and tokenizers 0.22 with only the "onig" feature.
 # That feature adds a regex library with C/C++ build scripts.
-candle = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:serde", "dep:serde_json"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:tokenizers", "dep:serde"]
+# ColdIVF's trace of each search, which the worker hands back with every answer, for benchmarks.
+bench = ["coldivf/bench"]
+
+# Counts allocations with its own allocator, so it runs as its own program.
+[[test]]
+name = "alloc"
+path = "tests/alloc.rs"
+harness = false
 
 [dependencies]
 coldivf.workspace = true
+# crc32fast: the checksums of the predictors file and of the training pairs log.
+crc32fast = "1.5.2"
+# faer: the f64 matrix products and the Cholesky factorization that fit the predictors.
+faer = { version = "0.24.4", default-features = false, features = ["std", "rayon"] }
+# serde_json: the cached fit of each disk volume's read speed, and with `candle` the model's settings files.
+serde_json = "1.0.145"
 # candle-core, candle-nn: the tensors and layers of the BERT encoder.
 candle-core = { version = "0.11.0", optional = true }
 candle-nn = { version = "0.11.0", optional = true }
 # tokenizers: reads the model's tokenizer.json. It is the copy candle-core already pulls in.
 tokenizers = { version = "0.22.2", optional = true, default-features = false, features = ["onig"] }
-# serde, serde_json: read the model's config.json and its sentence-transformers settings.
+# serde: reads the model's config.json and its sentence-transformers settings.
 serde = { version = "1.0.228", optional = true, features = ["derive"] }
-serde_json = { version = "1.0.145", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# libc: statfs, getattrlist and sysctlbyname, which tell disk volumes, chips and system builds apart.
+libc = "0.2.190"
 # On macOS the matrix products on the processor go through Accelerate, and the graphics processor runs on Metal.
 candle-core = { version = "0.11.0", optional = true, features = ["accelerate", "metal"] }
 candle-nn = { version = "0.11.0", optional = true, features = ["accelerate", "metal"] }

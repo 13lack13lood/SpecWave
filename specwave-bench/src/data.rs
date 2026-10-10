@@ -138,6 +138,30 @@ impl VectorSource for Fbin {
     }
 }
 
+/// Writes `values`, rows of `width` values, as an `.fbin` file at `path`. It writes `<path>.part` first and renames
+/// it, so a crash never leaves a partial file under the final name. A width of 0, values that don't fill whole rows,
+/// or more rows or a wider row than the header can hold give `InvalidInput`.
+pub fn write_fbin(path: &Path, values: &[f32], width: usize) -> Result<(), Error> {
+    let rows = values
+        .len()
+        .checked_div(width)
+        .filter(|rows| rows * width == values.len());
+    let (Some(Ok(count)), Ok(width)) = (rows.map(i32::try_from), i32::try_from(width)) else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "an .fbin file holds whole rows, of a width above 0",
+        ));
+    };
+    let mut bytes = Vec::with_capacity(8 + 4 * values.len());
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes.extend_from_slice(&width.to_le_bytes());
+    values.iter().for_each(|v| bytes.extend_from_slice(&v.to_le_bytes()));
+    let mut part = path.as_os_str().to_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    fs::write(&part, &bytes).and_then(|()| fs::rename(&part, path))
+}
+
 /// A mapped `.ibin` file of u32 rows, eg. each query's nearest neighbors, nearest first.
 pub struct Ibin(Table);
 

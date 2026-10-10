@@ -79,6 +79,30 @@ fn a_damaged_file_fails_with_invalid_data_and_a_missing_one_with_not_found() {
 }
 
 #[test]
+fn written_vectors_read_back_and_partial_rows_are_refused() {
+    let dir = scratch("write");
+    let path = dir.join("guesses.fbin");
+    let values: Vec<f32> = (0..12).map(|i| i as f32 * 0.25 - 1.0).collect();
+    write_fbin(&path, &values, 4).unwrap();
+    let read = Fbin::open(&path).unwrap();
+    assert_eq!((read.len(), read.dim(), read.values()), (3, 4, &values[..]));
+    let bits: Vec<u32> = values.iter().map(|v| v.to_bits()).collect();
+    assert_eq!(fs::read(&path).unwrap(), table(3, 4, &bits));
+    assert!(!dir.join("guesses.fbin.part").exists());
+
+    write_fbin(&path, &[], 5).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), table(0, 5, &[]));
+
+    for (what, values, width) in [("no width", &values[..], 0), ("a partial row", &values[..7], 3)] {
+        let found = write_fbin(&dir.join("bad.fbin"), values, width).err().map(|e| e.kind());
+        assert_eq!(found, Some(ErrorKind::InvalidInput), "{what}");
+        assert!(!dir.join("bad.fbin").exists(), "{what}");
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn guess_files_are_found_by_name_and_ordered_by_layer() {
     let dir = scratch("guesses");
     let files = Files::new(&dir, "fiqa");

@@ -1,6 +1,7 @@
 //! Unit tests for the candle encoder, on tiny random snapshots. The tests that compare the real models with the cached
 //! embeddings and with PyTorch's layer states are ignored, and run by hand.
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -122,6 +123,55 @@ fn only_wanted_layers_reach_the_hook() {
     assert_eq!(first, third);
 }
 
+/// A hook that notes each call it gets, eg. "wants 0" and "gets 0", and wants the layers in `wanted`.
+struct Events {
+    wanted: Vec<usize>,
+    seen: RefCell<Vec<String>>,
+}
+
+impl LayerHook for Events {
+    fn wants(&self, layer: usize) -> bool {
+        self.seen.borrow_mut().push(format!("wants {layer}"));
+        self.wanted.contains(&layer)
+    }
+
+    fn on_layer(&mut self, layer: usize, pooled: &[f32]) {
+        self.seen
+            .get_mut()
+            .push(format!("gets {layer} with {} values", pooled.len()));
+    }
+}
+
+#[test]
+fn the_hook_is_asked_about_each_layer_once_in_order_and_gets_only_the_layers_it_wants() {
+    let snapshot = tiny_snapshot("asked", &CLS_WITH_PROMPT);
+    let mut encoder = open(&snapshot);
+    let cases: [(&[usize], &[&str]); 4] = [
+        (&[], &["wants 0", "wants 1", "wants 2"]),
+        (&[1], &["wants 0", "wants 1", "gets 1 with 32 values", "wants 2"]),
+        (
+            &[0, 2],
+            &[
+                "wants 0",
+                "gets 0 with 32 values",
+                "wants 1",
+                "wants 2",
+                "gets 2 with 32 values",
+            ],
+        ),
+        (&[2, 5], &["wants 0", "wants 1", "wants 2", "gets 2 with 32 values"]),
+    ];
+
+    for (wanted, expected) in cases {
+        let mut hook = Events {
+            wanted: wanted.to_vec(),
+            seen: RefCell::default(),
+        };
+        encoder.encode(TEXT, &mut hook).unwrap();
+        assert_eq!(*hook.seen.borrow(), expected, "{wanted:?}");
+    }
+}
+
 #[test]
 fn mean_pooling_averages_the_last_layer_without_a_prompt() {
     let snapshot = tiny_snapshot(
@@ -151,6 +201,45 @@ fn texts_are_neither_padded_nor_left_too_long() {
 
     assert_eq!(encoder.tokens(TEXT).unwrap(), IDS.len());
     assert_eq!(encoder.tokens(&long).unwrap(), 20);
+}
+
+#[test]
+fn the_token_limit_can_be_lowered_but_never_past_the_models_positions() {
+    let snapshot = tiny_snapshot("max-tokens", &CLS_WITH_PROMPT);
+    let mut encoder = open(&snapshot);
+    let long = "how to save ".repeat(20);
+    assert_eq!((encoder.max_tokens(), encoder.tokens(&long).unwrap()), (20, 20));
+
+    // The prompt and the text keep 8 tokens between the classification token [CLS] and the separator [SEP].
+    encoder.set_max_tokens(10).unwrap();
+    assert_eq!((encoder.max_tokens(), encoder.tokens(&long).unwrap()), (10, 10));
+    let ids = [2, 4, 5, 6, 10, 11, 12, 10, 11, 3];
+    let embedding = encoder.encode(&long, &mut NoHook).unwrap();
+    assert_close(
+        &embedding,
+        &normalized(&states(&encoder, &ids)[2][..16]),
+        1e-6,
+        "the cut text",
+    );
+
+    encoder.set_max_tokens(100).unwrap();
+    assert_eq!((encoder.max_tokens(), encoder.tokens(&long).unwrap()), (32, 32));
+    assert_eq!(encoder.encode(&long, &mut NoHook).unwrap().len(), 16);
+    encoder.set_max_tokens(3).unwrap();
+    assert_eq!(encoder.tokens(&long).unwrap(), 3);
+    assert_eq!(encoder.set_max_tokens(2).unwrap_err().kind(), ErrorKind::InvalidInput);
+    assert_eq!((encoder.max_tokens(), encoder.tokens(&long).unwrap()), (3, 3));
+}
+
+#[test]
+fn only_metal_queues_its_work() {
+    let snapshot = tiny_snapshot("queues", &CLS_WITH_PROMPT);
+    assert!(!open(&snapshot).queues_work());
+
+    match CandleEncoder::open(&snapshot.0, Backend::Metal) {
+        Ok(encoder) => assert!(encoder.queues_work()),
+        Err(e) => assert_eq!(e.kind(), ErrorKind::Unsupported),
+    }
 }
 
 #[test]
