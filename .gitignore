@@ -15,3 +15,5 @@ results/
 *.swp
 .idea/
 .vscode/
+# run scripts, frozen binaries and logs of timing runs (they name the local workspace)
+runs/
