@@ -16,9 +16,9 @@
 //! queries' final embeddings, to compare the guesses and the model's own embeddings with.
 //!
 //! Texts and queries are JavaScript Object Notation (JSON) lines with a "text" field. `--max-tokens` cuts every text at
-//! that many tokens, counting the query prompt and the special tokens. `--model` takes the short name `arctic`, which
-//! also picks the default layers, or a Hugging Face repository id found in the local cache. Each run appends its result
-//! lines to `--out`, one per fitted layer and one per guessed layer.
+//! that many tokens, counting the query prompt and the special tokens. `--model` takes a short name of specwave's models
+//! list, eg. `arctic` or `bge-small`, which also picks the list's layers for it, or a Hugging Face repository id found
+//! in the local cache. Each run appends its result lines to `--out`, one per fitted layer and one per guessed layer.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use specwave::encoder::{Backend, CandleEncoder, LayerEncoder, LayerHook, snapshot_dir};
+use specwave::encoder::{Backend, CandleEncoder, LayerEncoder, LayerHook, models, snapshot_dir};
 use specwave::predictor::{self, Predictors};
 use specwave::train::{Pairs, TrainParams, refit};
 use specwave_bench::data::{Fbin, write_fbin};
@@ -103,10 +103,11 @@ impl Settings {
 
         let get = |name: &str| values.get(name).map(String::as_str);
         let model = get("model").ok_or_else(|| invalid("--model is required".to_string()))?;
-        let repo = repo_id(model).to_string();
-        let layers = match (get("layers"), default_layers(model)) {
+        let listed = models::find(model)?;
+        let repo = listed.map_or(model, |m| m.repo.as_str()).to_string();
+        let layers = match (get("layers"), listed) {
             (Some(v), _) => list(v, "layers")?,
-            (None, Some(layers)) => layers.to_vec(),
+            (None, Some(listed)) => listed.layers.clone(),
             (None, None) => return Err(invalid(format!("--layers is required for {model}"))),
         };
         let lambdas: Vec<f64> = get("lambdas").map_or(Ok(vec![1e-3, 1e-2, 1e-1]), |v| list(v, "lambdas"))?;
@@ -457,21 +458,6 @@ fn read_texts(path: &Path) -> Result<Vec<String>, Error> {
     }
 
     Ok(texts)
-}
-
-fn repo_id(model: &str) -> &str {
-    match model {
-        "arctic" => "Snowflake/snowflake-arctic-embed-m-v1.5",
-        other => other,
-    }
-}
-
-/// The layers that may fire for a model's short name.
-fn default_layers(model: &str) -> Option<&'static [usize]> {
-    match model {
-        "arctic" => Some(&[0, 3, 6, 8, 9, 10]),
-        _ => None,
-    }
 }
 
 /// An id shared by the lines of one run, from the time and the process id.

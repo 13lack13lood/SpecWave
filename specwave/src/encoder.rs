@@ -6,7 +6,7 @@
 //! It calls the hook with layer 0 after the embedding lookup, and with layer i + 1 after transformer layer i. It
 //! summarizes the layer on the device and copies back only 2d floats, where d is the embedding size. It does this
 //! only for the layers the hook wants, so on the graphics processor (GPU, through Metal) a query waits for the
-//! device once.
+//! device once. The [`models`] list names the models by short names and holds the settings their snapshots leave out.
 
 use std::io::Error;
 
@@ -14,6 +14,7 @@ use std::io::Error;
 mod bert;
 #[cfg(feature = "candle")]
 mod candle;
+pub mod models;
 
 #[cfg(feature = "candle")]
 pub use self::candle::{Backend, CandleEncoder, Pooling, snapshot_dir};
@@ -32,8 +33,9 @@ pub trait LayerEncoder {
     /// The number of transformer layers, L. Layers 0 to L can be observed.
     fn layers(&self) -> usize;
     fn dim(&self) -> usize;
-    /// Runs the model on `text` and calls `hook` at the layers it wants. It returns the final normalized embedding.
-    /// The arctic-embed-m model uses the CLS token with a query prefix, and MiniLM uses the average over the tokens.
+    /// Runs the model on the query `text` and calls `hook` at the layers it wants. It returns the final normalized
+    /// embedding. Each model pools and prompts its own way, eg. arctic-embed-m takes the CLS token with a query
+    /// prefix, and MiniLM the average over the tokens.
     fn encode(&mut self, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error>;
     /// Whether the device queues the model's work and runs it later, eg. the GPU through Metal, rather than running
     /// each step as it is issued, as the processor does. The hook then hears of a layer before the layer has run.

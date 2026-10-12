@@ -26,6 +26,14 @@ fn a_model_gives_the_default_layers_and_every_other_setting_has_a_default() {
     assert_eq!(s, expected);
     assert_eq!(parse(&["--model", "arctic"]).unwrap().texts, None);
 
+    // Every short name of the models list picks the list's layers, and the repository id does too.
+    let minilm = parse(&["--model", "minilm"]).unwrap();
+    assert_eq!(minilm.repo, "sentence-transformers/all-MiniLM-L6-v2");
+    assert_eq!(minilm.layers, [0, 1, 3, 4, 5]);
+    let bge = parse(&["--model", "BAAI/bge-large-en-v1.5"]).unwrap();
+    assert_eq!(bge, parse(&["--model", "bge-large"]).unwrap());
+    assert_eq!(bge.layers, [0, 6, 12, 16, 18, 19, 20, 21, 22, 23]);
+
     let s = parse(&[
         "--model",
         "org/other",
@@ -75,12 +83,11 @@ fn a_model_gives_the_default_layers_and_every_other_setting_has_a_default() {
 
 #[test]
 fn bad_or_incomplete_command_lines_give_invalid_input() {
-    let bad: [&[&str]; 18] = [
+    let bad: [&[&str]; 17] = [
         &[],
         &["--texts", "t.jsonl"],
+        // A model that isn't in the models list needs its layers.
         &["--model", "org/other"],
-        // A model without a short name needs its layers.
-        &["--model", "minilm"],
         &["--model", "arctic", "--layer", "3"],
         &["--model", "arctic", "--model", "arctic"],
         &["--model", "arctic", "--layers"],

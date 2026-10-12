@@ -380,6 +380,11 @@ fn the_command_line_needs_its_three_files_and_takes_each_name_once() {
     };
     assert_eq!(parse(&given).unwrap(), expected);
 
+    // A short name of the models list gives its repository id.
+    let mut short = files.to_vec();
+    short.extend(["--model", "e5-base"]);
+    assert_eq!(parse(&short).unwrap().model, "intfloat/e5-base-v2");
+
     let bad: [&[&str]; 7] = [
         &files[2..],
         &["--coverage", "a", "--cold", "c"],
@@ -435,12 +440,14 @@ fn the_rows_come_from_the_files_that_the_command_line_names() {
     };
     let grid: Vec<String> = grid().iter().map(|c| grid_line(c, 7)).collect();
     let (first, second) = grid.split_at(5);
+    // The layers binary names the model by its repository id, which the short name `arctic` stands for.
+    let arctic = "Snowflake/snowflake-arctic-embed-m-v1.5";
     let layers = vec![
-        layer_line("arctic", "cpu", 5, 0, 0.1),
-        layer_line("arctic", "cpu", 5, 8, 11.0),
-        layer_line("arctic", "cpu", 5, 9, 12.0),
-        layer_line("arctic", "cpu", 5, 10, 13.5),
-        layer_line("arctic", "cpu", 5, 12, 16.0),
+        layer_line(arctic, "cpu", 5, 0, 0.1),
+        layer_line(arctic, "cpu", 5, 8, 11.0),
+        layer_line(arctic, "cpu", 5, 9, 12.0),
+        layer_line(arctic, "cpu", 5, 10, 13.5),
+        layer_line(arctic, "cpu", 5, 12, 16.0),
     ];
     let cold = vec![
         trial(PREWARM, 9, 58, 10, [0.0, 500.0, 30.0, 700.0, 0.0, 0.0]),
@@ -474,7 +481,21 @@ fn the_rows_come_from_the_files_that_the_command_line_names() {
     // The cold trials measure only nprobe 9 with R 29, where layer 10's 1.23 ms fits its 2.5 ms.
     assert_eq!(measured, [(9, "29", Some(10)), (9, "39", None), (11, "29", None)]);
 
-    let other_model = ["--coverage", &names, "--layers", &layers, "--cold", &cold];
+    assert_eq!(
+        rows(&parse(&args[..6]).unwrap()).unwrap().len(),
+        found.len(),
+        "arctic is the default model"
+    );
+    let other_model = [
+        "--coverage",
+        &names,
+        "--layers",
+        &layers,
+        "--cold",
+        &cold,
+        "--model",
+        "bge-small",
+    ];
     let other_dataset = [
         "--coverage",
         &names,

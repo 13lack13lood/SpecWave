@@ -23,7 +23,8 @@
 //! Each run then times the whole model with no hook. The tables and the results file hold the medians over the runs,
 //! by nearest rank.
 //!
-//! `--model` takes short names (`arctic`, `minilm`) or Hugging Face repository ids, found in the local cache.
+//! `--model` takes the short names of specwave's models list, eg. `arctic`, `minilm` or `bge-small`, or Hugging Face
+//! repository ids, found in the local cache.
 //! `--queries` is a JSON (JavaScript Object Notation) lines file of {row, id, text}, and `--split` keeps the rows that
 //! the `.splits.json` file next to it lists under that name, eg. the test split of BeIR (Benchmarking Information
 //! Retrieval). `--split all` keeps every row. The timings belong to this machine and its load, so time an idle machine.
@@ -36,7 +37,7 @@ use std::process::Command;
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use specwave::encoder::{Backend, CandleEncoder, LayerEncoder, LayerHook, NoHook, snapshot_dir};
+use specwave::encoder::{Backend, CandleEncoder, LayerEncoder, LayerHook, NoHook, models, snapshot_dir};
 use specwave_bench::results::{Json, append, provenance};
 
 /// The environment variables that set the processor's thread counts, for candle's pools and for Accelerate.
@@ -190,7 +191,7 @@ fn time_setup(args: &Args, device: &str) -> Result<(), Error> {
     }
 
     set_user_interactive();
-    let repo = repo_id(model);
+    let repo = models::repo(model)?;
     let queries = read_queries(&queries_path, split)?;
     let started = Instant::now();
     let mut encoder = CandleEncoder::open(&snapshot_dir(repo)?, backend)?;
@@ -436,14 +437,6 @@ fn set_user_interactive() {
 
 #[cfg(not(target_os = "macos"))]
 fn set_user_interactive() {}
-
-fn repo_id(model: &str) -> &str {
-    match model {
-        "arctic" => "Snowflake/snowflake-arctic-embed-m-v1.5",
-        "minilm" => "sentence-transformers/all-MiniLM-L6-v2",
-        other => other,
-    }
-}
 
 /// An id shared by the lines of one invocation, from the time and the process id.
 fn run_id() -> String {

@@ -2,10 +2,17 @@
 //!
 //! A snapshot holds `config.json`, `model.safetensors` and `tokenizer.json`, plus the sentence-transformers settings
 //! in `modules.json`, `sentence_bert_config.json`, `config_sentence_transformers.json` and the pooling folder that
-//! `modules.json` names, eg. `1_Pooling/config.json`. The query prompt and the pooling come from those settings. For
-//! arctic-embed-m that is the state of the classification (CLS) token, with the prefix "Represent this sentence for
-//! searching relevant passages: " in front of each query. For all-MiniLM-L6-v2 it is the average over the tokens,
-//! with no prefix.
+//! `modules.json` names, eg. `1_Pooling/config.json`. The sizes come from `config.json`, and the rest from those
+//! settings, as sentence-transformers reads them.
+//! - **Pooling.** The state of the classification (CLS) token, eg. for arctic-embed-m, or the average over the
+//!   tokens, eg. for all-MiniLM-L6-v2 and e5-base-v2.
+//! - **Prompts.** The text in front of each query and of each passage, i.e. each document of the corpus, eg. "query: "
+//!   and "passage: " for e5-base-v2. A model whose settings don't hold its prompts, eg. bge-small-en-v1.5, gets them
+//!   from the [`models`](super::models) list, which names the file of the snapshot that gives them.
+//! - **Lowercasing.** `do_lower_case` puts a lowercasing step in front of the tokenizer's own steps, unless they hold
+//!   one already.
+//! - **Normalization.** The encoder always returns an embedding of length 1, for searches by cosine. It refuses a
+//!   model with no normalizing module whose settings name a similarity other than cosine.
 //!
 //! The encoder takes one text at a time, so there is no padding and the average over the tokens is the masked
 //! average. Each layer's summary, concat(average, first token), is computed on the device, and only the summaries the
@@ -19,9 +26,11 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use tokenizers::{PostProcessor, Tokenizer, TruncationParams};
+use tokenizers::normalizers::{Lowercase, Sequence};
+use tokenizers::{NormalizerWrapper, PostProcessor, Tokenizer, TruncationParams};
 
 use super::bert::{BertModel, Config};
+use super::models::{self, Model};
 use super::{LayerEncoder, LayerHook, NoHook};
 
 /// Where the model runs.
@@ -43,12 +52,13 @@ pub enum Pooling {
     Mean,
 }
 
-/// A sentence-transformers BERT model on candle, with its tokenizer, query prompt and pooling.
+/// A sentence-transformers BERT model on candle, with its tokenizer, prompts and pooling.
 pub struct CandleEncoder {
     model: BertModel,
     tokenizer: Tokenizer,
     device: Device,
     prompt: String,
+    passage_prompt: String,
     pooling: Pooling,
     dim: usize,
     layers: usize,
@@ -57,12 +67,18 @@ pub struct CandleEncoder {
 }
 
 impl CandleEncoder {
-    /// Loads the model in `snapshot`, a Hugging Face snapshot directory, onto `backend`. A missing file keeps its
-    /// `NotFound`, a damaged one gives `InvalidData`, and settings this encoder can't follow, eg. an extra dense layer
-    /// after the pooling, give `Unsupported`, as does Metal where it isn't available.
+    /// Loads the model in `snapshot`, a Hugging Face snapshot directory, onto `backend`. When the snapshot sits in the
+    /// Hugging Face cache under a model of the [`models`](super::models) list, eg. bge-small-en-v1.5, the prompts that
+    /// the list holds fill in what its settings leave out. A missing file keeps its `NotFound`, a damaged one gives
+    /// `InvalidData`, as does a listed prompt that its settings give otherwise. Settings this encoder can't follow, eg.
+    /// an extra dense layer after the pooling, give `Unsupported`, as does Metal where it isn't available.
     pub fn open(snapshot: &Path, backend: Backend) -> Result<CandleEncoder, Error> {
         let config: Config = read_json(&snapshot.join("config.json"))?;
-        let settings = Settings::read(snapshot)?;
+        let listed = match repo_of(snapshot) {
+            Some(repo) => models::find(&repo)?,
+            None => None,
+        };
+        let settings = Settings::read(snapshot, listed)?;
 
         if config.num_hidden_layers == 0
             || config.num_attention_heads == 0
@@ -79,6 +95,7 @@ impl CandleEncoder {
         let tokenizer = read_tokenizer(
             &snapshot.join("tokenizer.json"),
             max_len.min(config.max_position_embeddings),
+            settings.lowercase,
         )?;
 
         // An id past the model's vocabulary fails on the processor, but Metal's lookup reads the last row instead. So
@@ -96,7 +113,8 @@ impl CandleEncoder {
             model,
             tokenizer,
             device,
-            prompt: settings.prompt,
+            prompt: settings.query,
+            passage_prompt: settings.passage,
             pooling: settings.pooling,
             dim: config.hidden_size,
             layers: config.num_hidden_layers,
@@ -130,37 +148,49 @@ impl CandleEncoder {
         &self.prompt
     }
 
+    /// The text put in front of every passage, eg. "passage: " for e5-base-v2. Most models have none.
+    pub fn passage_prompt(&self) -> &str {
+        &self.passage_prompt
+    }
+
     pub fn pooling(&self) -> Pooling {
         self.pooling
     }
 
-    /// How many tokens the model sees for `text`, counting the prompt and the special tokens.
+    /// How many tokens the model sees for the query `text`, counting the prompt and the special tokens.
     pub fn tokens(&self, text: &str) -> Result<usize, Error> {
-        Ok(self.tokenize(text)?.get_ids().len())
+        Ok(self.tokenize(&self.prompt, text)?.get_ids().len())
     }
 
-    /// Runs the model on `text` up to layer `layer`, then waits until the device has finished. On Metal the work is
-    /// queued, so the wait marks the moment layer `layer` is done. Timing this gives T_l, the model time to layer l.
+    /// Runs the model on the query `text` up to layer `layer`, then waits until the device has finished. On Metal the
+    /// work is queued, so the wait marks the moment layer `layer` is done. Timing this gives T_l, the model time to
+    /// layer l.
     pub fn run_to(&self, text: &str, layer: usize) -> Result<(), Error> {
         if layer > self.layers {
             return Err(Error::new(ErrorKind::InvalidInput, "the model has fewer layers"));
         }
 
-        self.run(text, layer, &mut NoHook)?;
+        self.run(&self.prompt, text, layer, &mut NoHook)?;
         self.device.synchronize().map_err(model_failure)
     }
 
-    fn tokenize(&self, text: &str) -> Result<tokenizers::Encoding, Error> {
-        let input = format!("{}{text}", self.prompt);
+    /// Runs the model on the passage `text`, a document of the corpus, with the passage prompt. It calls `hook` and
+    /// returns the final normalized embedding as `encode` does for a query.
+    pub fn encode_passage(&self, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error> {
+        self.embed(&self.passage_prompt, text, hook)
+    }
+
+    fn tokenize(&self, prompt: &str, text: &str) -> Result<tokenizers::Encoding, Error> {
+        let input = format!("{prompt}{text}");
         self.tokenizer
             .encode(input.as_str(), true)
             .map_err(|e| Error::other(e.to_string()))
     }
 
-    /// Runs the embeddings and `layers` transformer layers, hands the hook the summaries it wants, and returns the
-    /// last state.
-    fn run(&self, text: &str, layers: usize, hook: &mut dyn LayerHook) -> Result<Tensor, Error> {
-        let encoding = self.tokenize(text)?;
+    /// Runs the embeddings and `layers` transformer layers on `prompt` followed by `text`, hands the hook the summaries
+    /// it wants, and returns the last state.
+    fn run(&self, prompt: &str, text: &str, layers: usize, hook: &mut dyn LayerHook) -> Result<Tensor, Error> {
+        let encoding = self.tokenize(prompt, text)?;
         let input_ids = Tensor::new(encoding.get_ids(), &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(model_failure)?;
@@ -178,19 +208,10 @@ impl CandleEncoder {
             .forward_layers(&input_ids, &token_type_ids, None, layers, &mut observe)
             .map_err(model_failure)
     }
-}
 
-impl LayerEncoder for CandleEncoder {
-    fn layers(&self) -> usize {
-        self.layers
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn encode(&mut self, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error> {
-        let state = self.run(text, self.layers, hook)?;
+    /// Runs the whole model on `prompt` followed by `text` and returns its pooled last state, scaled to length 1.
+    fn embed(&self, prompt: &str, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error> {
+        let state = self.run(prompt, text, self.layers, hook)?;
         let pooled = match self.pooling {
             Pooling::Cls => state.i((0, 0)),
             Pooling::Mean => state.mean(1).and_then(|m| m.squeeze(0)),
@@ -204,6 +225,20 @@ impl LayerEncoder for CandleEncoder {
         let scale = (1.0 / norm.max(1e-12)) as f32;
         embedding.iter_mut().for_each(|x| *x *= scale);
         Ok(embedding)
+    }
+}
+
+impl LayerEncoder for CandleEncoder {
+    fn layers(&self) -> usize {
+        self.layers
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn encode(&mut self, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error> {
+        self.embed(&self.prompt, text, hook)
     }
 
     fn queues_work(&self) -> bool {
@@ -263,11 +298,28 @@ pub(crate) fn snapshot_in(hub: &Path, repo: &str) -> Result<PathBuf, Error> {
     }
 }
 
-/// The sentence-transformers settings of a snapshot.
+/// The repository id that a snapshot's place in the Hugging Face cache names, eg. "BAAI/bge-small-en-v1.5" for
+/// `<hub>/models--BAAI--bge-small-en-v1.5/snapshots/<commit>`, or None for a folder laid out otherwise. Repository ids
+/// never hold "--", so the cache's names map back to them.
+fn repo_of(snapshot: &Path) -> Option<String> {
+    let snapshots = snapshot.parent()?;
+
+    if snapshots.file_name()? != "snapshots" {
+        return None;
+    }
+
+    let name = snapshots.parent()?.file_name()?.to_str()?.strip_prefix("models--")?;
+    Some(name.replacen("--", "/", 1))
+}
+
+/// The sentence-transformers settings of a snapshot, with the prompts that the models list adds.
 struct Settings {
-    prompt: String,
+    query: String,
+    passage: String,
     pooling: Pooling,
     max_len: Option<usize>,
+    /// Whether each text is lowercased before the tokenizer's own steps.
+    lowercase: bool,
 }
 
 #[derive(Deserialize)]
@@ -300,25 +352,33 @@ struct PoolingConfig {
 struct PromptConfig {
     #[serde(default)]
     prompts: HashMap<String, String>,
+    similarity_fn_name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct SentenceBertConfig {
     max_seq_length: Option<usize>,
+    #[serde(default)]
+    do_lower_case: bool,
 }
 
 fn yes() -> bool {
     true
 }
 
+/// The names a passage prompt goes by in sentence-transformers' settings, in the order it tries them.
+const PASSAGE_NAMES: [&str; 3] = ["document", "passage", "corpus"];
+
 impl Settings {
-    fn read(snapshot: &Path) -> Result<Settings, Error> {
+    /// Reads the settings of `snapshot`. `listed` is its model's entry in the models list, if it has one.
+    fn read(snapshot: &Path, listed: Option<&Model>) -> Result<Settings, Error> {
         let modules: Vec<ModuleEntry> = read_json(&snapshot.join("modules.json"))?;
-        let mut pooling_dir = None;
+        let (mut pooling_dir, mut normalizes) = (None, false);
 
         for module in &modules {
             match module.kind.rsplit('.').next() {
-                Some("Transformer" | "Normalize") => {}
+                Some("Transformer") => {}
+                Some("Normalize") => normalizes = true,
                 Some("Pooling") => pooling_dir = Some(snapshot.join(&module.path)),
                 _ => return Err(unsupported(&format!("a {} module", module.kind))),
             }
@@ -328,7 +388,23 @@ impl Settings {
         let config: PoolingConfig = read_json(&pooling_dir.join("config.json"))?;
         let prompts: PromptConfig = read_json_or_default(&snapshot.join("config_sentence_transformers.json"))?;
         let sbert: SentenceBertConfig = read_json_or_default(&snapshot.join("sentence_bert_config.json"))?;
-        let prompt = prompts.prompts.get("query").cloned().unwrap_or_default();
+
+        if !normalizes && prompts.similarity_fn_name.as_deref().is_some_and(|s| s != "cosine") {
+            return Err(unsupported(
+                "a model scored by a similarity other than cosine without a normalizing module",
+            ));
+        }
+
+        let query = pick_prompt(
+            &prompts.prompts,
+            &["query"],
+            listed.and_then(|m| m.query_prompt.as_deref()),
+        )?;
+        let passage = pick_prompt(
+            &prompts.prompts,
+            &PASSAGE_NAMES,
+            listed.and_then(|m| m.passage_prompt.as_deref()),
+        )?;
         let others = config.pooling_mode_max_tokens
             || config.pooling_mode_mean_sqrt_len_tokens
             || config.pooling_mode_weightedmean_tokens
@@ -343,21 +419,37 @@ impl Settings {
             }
         };
 
-        if pooling == Pooling::Mean && !config.include_prompt && !prompt.is_empty() {
+        if pooling == Pooling::Mean && !config.include_prompt && !(query.is_empty() && passage.is_empty()) {
             return Err(unsupported("an average that leaves out the prompt"));
         }
 
         Ok(Settings {
-            prompt,
+            query,
+            passage,
             pooling,
             max_len: sbert.max_seq_length,
+            lowercase: sbert.do_lower_case,
         })
     }
 }
 
+/// The prompt under the first of `names` in a snapshot's `prompts`, or else the prompt the models list gives, or else
+/// none. A listed prompt that the snapshot gives otherwise gives `InvalidData`, so the list never hides a change.
+fn pick_prompt(prompts: &HashMap<String, String>, names: &[&str], listed: Option<&str>) -> Result<String, Error> {
+    match (names.iter().find_map(|name| prompts.get(*name)), listed) {
+        (Some(own), Some(listed)) if own != listed => Err(damaged(format!(
+            "the models list gives the prompt {listed:?}, but the snapshot gives {own:?}"
+        ))),
+        (Some(own), _) => Ok(own.clone()),
+        (None, listed) => Ok(listed.unwrap_or_default().to_string()),
+    }
+}
+
 /// The tokenizer in `path`, set to cut texts at `max_len` tokens and never to pad. Some snapshots pad every text to a
-/// fixed length, eg. all-MiniLM-L6-v2 to 128 tokens, which sentence-transformers turns off too.
-fn read_tokenizer(path: &Path, max_len: usize) -> Result<Tokenizer, Error> {
+/// fixed length, eg. all-MiniLM-L6-v2 to 128 tokens, which sentence-transformers turns off too. With `lowercase` a
+/// lowercasing step goes in front of the tokenizer's own steps unless they hold one already, as sentence-transformers
+/// does for `do_lower_case`.
+fn read_tokenizer(path: &Path, max_len: usize, lowercase: bool) -> Result<Tokenizer, Error> {
     let bytes = std::fs::read(path)?;
     let mut tokenizer = Tokenizer::from_bytes(&bytes).map_err(|e| damaged(format!("tokenizer.json: {e}")))?;
 
@@ -367,6 +459,20 @@ fn read_tokenizer(path: &Path, max_len: usize) -> Result<Tokenizer, Error> {
 
     tokenizer.with_padding(None);
     truncate(&mut tokenizer, max_len).map_err(|e| damaged(format!("tokenizer.json: {e}")))?;
+
+    if lowercase {
+        let steps = match tokenizer.get_normalizer() {
+            None => vec![],
+            Some(NormalizerWrapper::Sequence(steps)) => steps.as_ref().to_vec(),
+            Some(step) => vec![step.clone()],
+        };
+        if !steps.iter().any(|s| matches!(s, NormalizerWrapper::Lowercase(_))) {
+            let mut lowered: Vec<NormalizerWrapper> = vec![Lowercase.into()];
+            lowered.extend(steps);
+            tokenizer.with_normalizer(Some(Sequence::new(lowered)));
+        }
+    }
+
     Ok(tokenizer)
 }
 

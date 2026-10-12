@@ -32,7 +32,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use coldivf::{Hit, Index, Limits, SearchCtx, SearchParams, Trace, data_file};
-use specwave::encoder::{LayerEncoder, LayerHook};
+use specwave::encoder::{LayerEncoder, LayerHook, models};
 use specwave::predictor::{self, Predictors, Ridge};
 use specwave::scheduler::{
     Layer0, LayerProfile, LayerSettings, ReadTimes, Schedule, Volume, WaveModel, choose, support_dir,
@@ -1047,7 +1047,7 @@ impl Settings {
             truth: PathBuf::from(need("truth")?),
             queries: PathBuf::from(need("queries")?),
             guesses,
-            model: repo_id(get("model").unwrap_or("arctic")).to_string(),
+            model: models::repo(get("model").unwrap_or("arctic"))?.to_string(),
             models: path("models", "models"),
             max_tokens: number("max-tokens", 128)?,
             base,
@@ -1286,14 +1286,6 @@ pub fn rank(values: &[f64], p: f64) -> f64 {
     match sorted.len() {
         0 => f64::NAN,
         n => sorted[((p / 100.0 * n as f64).ceil() as usize).clamp(1, n) - 1],
-    }
-}
-
-/// The repository id of a model's short name, `arctic`, or the name itself.
-pub fn repo_id(model: &str) -> &str {
-    match model {
-        "arctic" => "Snowflake/snowflake-arctic-embed-m-v1.5",
-        other => other,
     }
 }
 

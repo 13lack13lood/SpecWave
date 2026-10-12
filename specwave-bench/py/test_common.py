@@ -159,6 +159,56 @@ class Ids(unittest.TestCase):
             self.assertFalse(c.up_to_date([out], os.path.join(d, "y.json"), a=1), "no .json file")
 
 
+class ModelList(unittest.TestCase):
+    def test_entries_by_short_name_or_repository(self):
+        names = [e["name"] for e in c.listed_models()]
+        self.assertEqual(names[:2], ["arctic", "minilm"])
+        self.assertEqual(c.listed("BAAI/bge-small-en-v1.5"), c.listed("bge-small"))
+        self.assertEqual(c.listed("arctic")["layers"], [0, 3, 6, 8, 9, 10])
+        with self.assertRaises(KeyError):
+            c.listed("org/other")
+
+    def snapshot(self, hub, prompts=None, readme=""):
+        """A snapshot of org/x in the cache folder `hub`, with these sentence-transformers prompts and model card."""
+        model = os.path.join(hub, "models--org--x")
+        folder = os.path.join(model, "snapshots", "c0")
+        os.makedirs(folder, exist_ok=True)
+        os.makedirs(os.path.join(model, "refs"), exist_ok=True)
+        pathlib.Path(model, "refs", "main").write_text("c0\n")
+        pathlib.Path(folder, "README.md").write_text(readme)
+        settings = pathlib.Path(folder, "config_sentence_transformers.json")
+        if prompts is None:
+            settings.unlink(missing_ok=True)
+        else:
+            c.write_json(str(settings), {"prompts": prompts})
+        return folder
+
+    def test_prompts_come_from_the_snapshot_else_from_the_list(self):
+        listed = dict(name="x", repo="org/x", layers=[0], query_prompt="query: ", passage_prompt="passage: ",
+                      prompts_from="README.md")
+        card = 'Start each text with "query: " or "passage: ".'
+        with tempfile.TemporaryDirectory() as hub, mock.patch.object(c, "HUB", hub):
+            folder = self.snapshot(hub, readme=card)
+            self.assertEqual(c.snapshot("org/x"), folder)
+            self.assertEqual(c.prompts(listed), ("query: ", "passage: "))
+            self.snapshot(hub, {"query": "query: ", "document": "passage: "}, card)
+            self.assertEqual(c.prompts(listed), ("query: ", "passage: "))
+
+            own = dict(name="x", repo="org/x", layers=[0])
+            for prompts, expected in (({"query": "q: ", "corpus": "c: ", "passage": "p: ", "document": "d: "},
+                                       ("q: ", "d: ")), ({"corpus": "c: ", "passage": "p: "}, ("", "p: ")),
+                                      ({}, ("", ""))):
+                self.snapshot(hub, prompts)
+                self.assertEqual(c.prompts(own), expected, prompts)
+
+            self.snapshot(hub, {"query": "search: "}, card)
+            with self.assertRaises(ValueError):
+                c.prompts(listed)
+            self.snapshot(hub, None, "no prompts here")
+            with self.assertRaises(ValueError):
+                c.prompts(listed)
+
+
 class Openings(unittest.TestCase):
     def test_draw(self):
         texts = [" ".join(f"w{i}x{j}" for j in range(i % 40)) for i in range(300)]

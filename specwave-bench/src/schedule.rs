@@ -18,6 +18,7 @@ use std::fmt::Write;
 use std::io::{Error, ErrorKind};
 
 use coldivf::SearchParams;
+use specwave::encoder::models;
 use specwave::scheduler::{Fire, LayerProfile, LayerSettings, ReadTimes, Schedule, choose, evaluate};
 use specwave::speculate::SpecParams;
 
@@ -470,7 +471,7 @@ pub struct Settings {
     pub dataset: String,
     pub fit: String,
     pub clustering: String,
-    /// The model whose setups get rows, eg. "Snowflake/snowflake-arctic-embed-m-v1.5".
+    /// The model whose setups get rows, by its repository id, eg. "Snowflake/snowflake-arctic-embed-m-v1.5".
     pub model: String,
     /// The rerank coverage that the rule judges, a position in the verdict module's `DEFINITIONS`.
     pub definition: usize,
@@ -525,7 +526,7 @@ impl Settings {
             dataset: get("dataset").unwrap_or_else(|| "fiqa".to_string()),
             fit: get("fit").unwrap_or_else(|| "openings".to_string()),
             clustering: get("clustering").unwrap_or_else(|| "l2".to_string()),
-            model: get("model").unwrap_or_else(|| "Snowflake/snowflake-arctic-embed-m-v1.5".to_string()),
+            model: models::repo(&get("model").unwrap_or_else(|| "arctic".to_string()))?.to_string(),
             definition,
             out: get("out"),
         })

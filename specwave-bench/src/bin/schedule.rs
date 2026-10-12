@@ -2,14 +2,14 @@
 //!
 //! ```text
 //! schedule --coverage FILE[,FILE...] --layers FILE --cold FILE [--dataset fiqa] [--fit openings] [--clustering l2]
-//!          [--model Snowflake/snowflake-arctic-embed-m-v1.5] [--definition rerank_coverage_normal] [--out FILE]
+//!          [--model arctic] [--definition rerank_coverage_normal] [--out FILE]
 //! ```
 //!
 //! The coverage files hold `spec_coverage` results, judged with the verdict module's default rule. The layers file
 //! holds `layers` results, and the cold file ColdIVF's cold trials. Every setup of `--model` in the layers file, every
-//! source of the cold trials, and every nprobe and R of the coverage grid gets a row. `--definition` names the rerank
-//! coverage that the rule judges, `rerank_coverage` or `rerank_coverage_normal`. `--out` appends a result line for
-//! each row.
+//! source of the cold trials, and every nprobe and R of the coverage grid gets a row. `--model` takes a short name of
+//! specwave's models list or a Hugging Face repository id. `--definition` names the rerank coverage that the rule
+//! judges, `rerank_coverage` or `rerank_coverage_normal`. `--out` appends a result line for each row.
 
 use std::io::{Error, ErrorKind};
 use std::path::Path;

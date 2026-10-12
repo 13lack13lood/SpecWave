@@ -49,7 +49,7 @@ impl LayerHook for Recorder {
 
 /// The model's states for `ids`, layer by layer, straight from the network.
 fn states(encoder: &CandleEncoder, ids: &[u32]) -> Vec<Vec<f32>> {
-    let input_ids = Tensor::new(ids, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+    let input_ids = Tensor::new(ids, &encoder.device).unwrap().unsqueeze(0).unwrap();
     let token_type_ids = input_ids.zeros_like().unwrap();
     let mut states = Vec::new();
     encoder
@@ -465,6 +465,248 @@ fn texts_stop_at_the_last_position_the_model_has() {
     assert_eq!(encoder.encode(&long, &mut NoHook).unwrap().len(), 16);
 }
 
+/// Writes `prompts` as the sentence-transformers prompts of `snapshot`.
+fn set_prompts(snapshot: &Path, prompts: serde_json::Value) {
+    let json = serde_json::json!({"prompts": prompts, "default_prompt_name": null});
+    std::fs::write(snapshot.join("config_sentence_transformers.json"), json.to_string()).unwrap();
+}
+
+#[test]
+fn a_passage_takes_the_passage_prompt_and_a_query_the_query_prompt() {
+    let snapshot = tiny_snapshot("passage", &CLS_WITH_PROMPT);
+    set_prompts(&snapshot.0, serde_json::json!({"query": PROMPT, "passage": "how to: "}));
+    let mut encoder = open(&snapshot);
+    let passage_ids = [2, 10, 11, 6, 7, 8, 9, 3];
+    let mut hook = Recorder::new(&[1]);
+    let passage = encoder.encode_passage(TEXT, &mut hook).unwrap();
+    let query = encoder.encode(TEXT, &mut NoHook).unwrap();
+
+    assert_eq!((encoder.prompt(), encoder.passage_prompt()), (PROMPT, "how to: "));
+    assert_eq!(encoder.tokenize("how to: ", TEXT).unwrap().get_ids(), passage_ids);
+    let states = states(&encoder, &passage_ids);
+    assert_close(&passage, &normalized(&states[2][..16]), 1e-6, "the passage");
+    assert_eq!(hook.seen.iter().map(|(layer, _)| *layer).collect::<Vec<_>>(), [1]);
+    assert_close(&hook.seen[0].1, &host_summary(&states[1], 8, 16), 1e-6, "layer 1");
+    assert_eq!(query, encoder.encode(TEXT, &mut NoHook).unwrap());
+    assert_ne!(query, passage);
+}
+
+#[test]
+fn the_passage_prompt_is_the_document_prompt_else_the_passage_one_else_the_corpus_one() {
+    let cases = [
+        (
+            serde_json::json!({"query": PROMPT, "corpus": "save: ", "passage": "how to: ", "document": "to: "}),
+            "to: ",
+        ),
+        (
+            serde_json::json!({"query": PROMPT, "corpus": "save: ", "passage": "how to: "}),
+            "how to: ",
+        ),
+        (serde_json::json!({"corpus": "save: "}), "save: "),
+        (serde_json::json!({"query": PROMPT}), ""),
+    ];
+
+    for (i, (prompts, expected)) in cases.into_iter().enumerate() {
+        let snapshot = tiny_snapshot(&format!("passage-names-{i}"), &CLS_WITH_PROMPT);
+        set_prompts(&snapshot.0, prompts);
+        assert_eq!(open(&snapshot).passage_prompt(), expected, "case {i}");
+    }
+
+    // An average over the tokens can't leave out a passage prompt either.
+    let snapshot = tiny_snapshot(
+        "mean-without-passage-prompt",
+        &Kind {
+            cls: false,
+            prompt: None,
+            layers: 2,
+        },
+    );
+    set_prompts(&snapshot.0, serde_json::json!({"passage": "how to: "}));
+    set_field(&snapshot, "1_Pooling/config.json", "include_prompt", false.into());
+    let found = CandleEncoder::open(&snapshot.0, Backend::Cpu).err().map(|e| e.kind());
+    assert_eq!(found, Some(ErrorKind::Unsupported));
+}
+
+/// Moves a tiny snapshot into `hub` the way the Hugging Face cache lays out a snapshot of `repo`, and returns its new
+/// place.
+fn in_hub(hub: &TempSnapshot, repo: &str, snapshot: TempSnapshot) -> PathBuf {
+    let snapshots = hub
+        .0
+        .join(format!("models--{}", repo.replace('/', "--")))
+        .join("snapshots");
+    std::fs::create_dir_all(&snapshots).unwrap();
+    std::fs::rename(&snapshot.0, snapshots.join("c0")).unwrap();
+    snapshots.join("c0")
+}
+
+#[test]
+fn a_listed_model_in_the_cache_gets_the_prompts_its_settings_leave_out() {
+    let hub = TempSnapshot(std::env::temp_dir().join(format!("specwave-{}-hub-listed", std::process::id())));
+    let plain = Kind {
+        cls: false,
+        prompt: None,
+        layers: 2,
+    };
+    let e5 = in_hub(&hub, "intfloat/e5-base-v2", tiny_snapshot("listed", &plain));
+    let elsewhere = tiny_snapshot("listed-elsewhere", &plain);
+    let listed = CandleEncoder::open(&e5, Backend::Cpu).unwrap();
+    let other = open(&elsewhere);
+
+    assert_eq!((listed.prompt(), listed.passage_prompt()), ("query: ", "passage: "));
+    assert_eq!((other.prompt(), other.passage_prompt()), ("", ""));
+    // "query" is the unknown token [UNK] to the tiny tokenizer, and ":" its own token.
+    assert_eq!(
+        listed.tokenize("query: ", TEXT).unwrap().get_ids(),
+        [2, 1, 6, 7, 8, 9, 3]
+    );
+    assert_eq!((listed.tokens(TEXT).unwrap(), other.tokens(TEXT).unwrap()), (7, 5));
+}
+
+#[test]
+fn a_listed_prompt_that_the_snapshot_gives_otherwise_gives_invalid_data() {
+    let hub = TempSnapshot(std::env::temp_dir().join(format!("specwave-{}-hub-conflict", std::process::id())));
+    let e5 = in_hub(&hub, "intfloat/e5-base-v2", tiny_snapshot("conflict", &CLS_WITH_PROMPT));
+    let found = CandleEncoder::open(&e5, Backend::Cpu).err().map(|e| e.kind());
+    assert_eq!(found, Some(ErrorKind::InvalidData));
+
+    set_prompts(&e5, serde_json::json!({"query": "query: ", "document": "passage: "}));
+    let encoder = CandleEncoder::open(&e5, Backend::Cpu).unwrap();
+    assert_eq!((encoder.prompt(), encoder.passage_prompt()), ("query: ", "passage: "));
+
+    set_prompts(&e5, serde_json::json!({"query": "query: ", "document": ""}));
+    let found = CandleEncoder::open(&e5, Backend::Cpu).err().map(|e| e.kind());
+    assert_eq!(found, Some(ErrorKind::InvalidData));
+}
+
+#[test]
+fn a_snapshot_in_the_cache_names_its_repository() {
+    let hub = Path::new("/hub");
+    let cases = [
+        (
+            "models--BAAI--bge-small-en-v1.5/snapshots/abc",
+            Some("BAAI/bge-small-en-v1.5"),
+        ),
+        ("models--bert-base-uncased/snapshots/abc", Some("bert-base-uncased")),
+        ("models--org--name/refs/abc", None),
+        ("org/name/snapshots/abc", None),
+        ("snapshots/abc", None),
+        ("abc", None),
+    ];
+
+    for (path, expected) in cases {
+        assert_eq!(repo_of(&hub.join(path)).as_deref(), expected, "{path}");
+    }
+
+    assert_eq!(repo_of(Path::new("/")), None);
+}
+
+#[test]
+fn do_lower_case_puts_a_lowercasing_step_in_front_unless_the_tokenizer_has_one() {
+    let lowered = vec![2, 4, 5, 6, 7, 8, 9, 3];
+    let lowercase = serde_json::json!({"type": "Lowercase"});
+    let nfc = serde_json::json!({"type": "NFC"});
+    let cases = [
+        (
+            "no-step",
+            serde_json::Value::Null,
+            false,
+            vec![2, 4, 5, 6, 1, 1, 1, 3],
+            None,
+        ),
+        (
+            "no-step-lowered",
+            serde_json::Value::Null,
+            true,
+            lowered.clone(),
+            Some(serde_json::json!({"type": "Sequence", "normalizers": [lowercase]})),
+        ),
+        (
+            "nfc-lowered",
+            serde_json::json!({"type": "Sequence", "normalizers": [nfc]}),
+            true,
+            lowered.clone(),
+            Some(serde_json::json!({"type": "Sequence", "normalizers": [lowercase, nfc]})),
+        ),
+        (
+            "nfc-alone-lowered",
+            nfc.clone(),
+            true,
+            lowered.clone(),
+            Some(serde_json::json!({"type": "Sequence", "normalizers": [lowercase, nfc]})),
+        ),
+        (
+            "lowercase-kept",
+            lowercase.clone(),
+            true,
+            lowered.clone(),
+            Some(lowercase.clone()),
+        ),
+        (
+            "lowercase-alone",
+            lowercase.clone(),
+            false,
+            lowered,
+            Some(lowercase.clone()),
+        ),
+    ];
+
+    for (name, normalizer, do_lower_case, ids, steps) in cases {
+        let snapshot = tiny_snapshot(name, &CLS_WITH_PROMPT);
+        edit_tokenizer(&snapshot, |t| t["normalizer"] = normalizer.clone());
+        set_field(
+            &snapshot,
+            "sentence_bert_config.json",
+            "do_lower_case",
+            do_lower_case.into(),
+        );
+        let encoder = open(&snapshot);
+        assert_eq!(
+            encoder.tokenize(PROMPT, "CHEAP INDEX FUNDS").unwrap().get_ids(),
+            ids,
+            "{name}"
+        );
+        let found = encoder
+            .tokenizer
+            .get_normalizer()
+            .map(|n| serde_json::to_value(n).unwrap());
+        assert_eq!(found, steps, "{name}");
+    }
+}
+
+#[test]
+fn an_embedding_of_length_1_must_fit_the_models_similarity() {
+    let cases = [
+        ("dot-normalized", true, Some("dot"), None),
+        ("dot-raw", false, Some("dot"), Some(ErrorKind::Unsupported)),
+        ("euclidean-raw", false, Some("euclidean"), Some(ErrorKind::Unsupported)),
+        ("cosine-raw", false, Some("cosine"), None),
+        ("unnamed-raw", false, None, None),
+    ];
+
+    let module = |kind: &str, path: &str| serde_json::json!({"path": path, "type": format!("models.{kind}")});
+
+    for (name, normalizes, similarity, expected) in cases {
+        let snapshot = tiny_snapshot(name, &CLS_WITH_PROMPT);
+        let mut modules = vec![module("Transformer", ""), module("Pooling", "1_Pooling")];
+        if normalizes {
+            modules.push(module("Normalize", "2_Normalize"));
+        }
+        std::fs::write(
+            snapshot.0.join("modules.json"),
+            serde_json::Value::from(modules).to_string(),
+        )
+        .unwrap();
+        set_field(
+            &snapshot,
+            "config_sentence_transformers.json",
+            "similarity_fn_name",
+            similarity.into(),
+        );
+        let found = CandleEncoder::open(&snapshot.0, Backend::Cpu).err().map(|e| e.kind());
+        assert_eq!(found, expected, "{name}");
+    }
+}
+
 #[test]
 fn a_snapshot_is_found_through_refs_main_or_as_the_only_one() {
     let hub = TempSnapshot(std::env::temp_dir().join(format!("specwave-{}-hub", std::process::id())));
@@ -673,4 +915,205 @@ fn arctic_matches_pytorchs_layer_states_of_the_fiqa_test_queries() {
 #[ignore = "reads the real models and PyTorch's stored layer states, run by hand"]
 fn minilm_matches_pytorchs_layer_states_of_the_quora_test_queries() {
     check_states("sentence-transformers/all-MiniLM-L6-v2", "quora");
+}
+
+/// The least cosine that a real model's embeddings must have with sentence-transformers'.
+const MATCH: f64 = 0.9999;
+
+/// Every value of an `.fbin` file, with its row width.
+fn read_fbin(path: &Path) -> (Vec<f32>, usize) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let width = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let values = bytes[8..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b))
+        .collect();
+    (values, width)
+}
+
+/// Every value of an `.ibin` file, which holds its row count and row width, then the rows as 32-bit integers.
+fn read_ibin(path: &Path) -> Vec<u32> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    bytes[8..]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| u32::from_le_bytes(b))
+        .collect()
+}
+
+/// Checks the listed model `name` on every backend against the references that `encoder_refs.py` wrote in
+/// `<data>/encoders/<name>/`, for its queries and its passages: the token ids, the embedding against
+/// sentence-transformers' and each layer's summary against transformers' hidden states. For the queries it also
+/// checks every token's state at every layer. The data folder is `$SPECWAVE_DATA`, else this repository's `data`.
+fn check_references(name: &str) {
+    let dir = data_path("SPECWAVE_DATA", "").join("encoders").join(name);
+    let meta_file = dir.join("meta.json");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_file).unwrap_or_else(|e| panic!("{}: {e}", meta_file.display())))
+            .unwrap();
+    let model = models::find(name).unwrap().unwrap();
+    let snapshot = snapshot_dir(&model.repo).unwrap();
+
+    for backend in backends() {
+        let mut encoder = CandleEncoder::open(&snapshot, backend).unwrap();
+        let every: Vec<usize> = (0..=encoder.layers()).collect();
+        let d = encoder.dim();
+        let mut shown = Vec::new();
+        assert_eq!(encoder.prompt(), meta["query_prompt"].as_str().unwrap());
+        assert_eq!(encoder.passage_prompt(), meta["passage_prompt"].as_str().unwrap());
+        assert_eq!(
+            (encoder.layers() as u64, d as u64),
+            (meta["layers"].as_u64().unwrap(), meta["dim"].as_u64().unwrap())
+        );
+
+        for set in ["queries", "passages"] {
+            let file = |stem: &str| dir.join(format!("{set}.{stem}"));
+            let texts = read_queries(&file("jsonl"), usize::MAX);
+            let (ids, lengths) = (read_ibin(&file("ids.ibin")), read_ibin(&file("lengths.ibin")));
+            let (st, width) = read_fbin(&file("st.fbin"));
+            let summaries: Vec<Vec<f32>> = every
+                .iter()
+                .map(|l| read_fbin(&file(&format!("L{l}.fbin"))).0)
+                .collect();
+            let tokens: Vec<Vec<f32>> = match set {
+                "queries" => every
+                    .iter()
+                    .map(|l| read_fbin(&file(&format!("tokens.L{l}.fbin"))).0)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let prompt = match set {
+                "queries" => encoder.prompt(),
+                _ => encoder.passage_prompt(),
+            }
+            .to_string();
+            let (mut start, mut worst, mut worst_layer, mut worst_token, mut largest) =
+                (0, f64::INFINITY, f64::INFINITY, f64::INFINITY, 0f32);
+            assert_eq!((texts.len(), lengths.len(), width), (50, 50, d));
+
+            for (i, (_, text)) in texts.iter().enumerate() {
+                let own = &ids[start..start + lengths[i] as usize];
+                assert_eq!(
+                    encoder.tokenize(&prompt, text).unwrap().get_ids(),
+                    own,
+                    "{name} {set} {i}"
+                );
+                let mut hook = Recorder::new(&every);
+                let found = match set {
+                    "queries" => encoder.encode(text, &mut hook),
+                    _ => encoder.encode_passage(text, &mut hook),
+                }
+                .unwrap();
+                let c = cosine(&found, &st[i * d..(i + 1) * d]);
+                assert!(c >= MATCH, "{name} on {backend:?}: {set} {i} has cosine {c}");
+                worst = worst.min(c);
+                assert_eq!(hook.seen.iter().map(|(l, _)| *l).collect::<Vec<_>>(), every);
+                for (layer, pooled) in &hook.seen {
+                    let c = cosine(pooled, &summaries[*layer][i * 2 * d..(i + 1) * 2 * d]);
+                    assert!(
+                        c >= AGREE,
+                        "{name} on {backend:?}: {set} {i} layer {layer} has cosine {c}"
+                    );
+                    worst_layer = worst_layer.min(c);
+                }
+                if !tokens.is_empty() {
+                    for (layer, state) in states(&encoder, own).iter().enumerate() {
+                        let expected = &tokens[layer][start * d..(start + own.len()) * d];
+                        for (f, e) in state.chunks_exact(d).zip(expected.chunks_exact(d)) {
+                            let c = cosine(f, e);
+                            assert!(
+                                c >= AGREE,
+                                "{name} on {backend:?}: query {i} layer {layer} has a token at {c}"
+                            );
+                            worst_token = worst_token.min(c);
+                            largest = f.iter().zip(e).fold(largest, |m, (a, b)| m.max((a - b).abs()));
+                        }
+                    }
+                }
+                start += own.len();
+            }
+
+            assert_eq!(start, ids.len());
+            shown.push(format!(
+                "{set} {:.1e}, layer summaries {:.1e}",
+                1.0 - worst,
+                1.0 - worst_layer
+            ));
+            if !tokens.is_empty() {
+                shown.push(format!(
+                    "query tokens {:.1e}, largest difference {largest:.1e}",
+                    1.0 - worst_token
+                ));
+            }
+        }
+
+        eprintln!(
+            "{name} on {backend:?}: token ids equal, 1 - cosine at worst: {}",
+            shown.join(", ")
+        );
+    }
+}
+
+#[test]
+#[ignore = "reads the real snapshots, run by hand"]
+fn listed_prompts_appear_in_the_files_they_come_from() {
+    for model in models::registered().unwrap() {
+        let Some(source) = &model.prompts_from else {
+            continue;
+        };
+        let path = snapshot_dir(&model.repo).unwrap().join(source);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for prompt in [&model.query_prompt, &model.passage_prompt].into_iter().flatten() {
+            assert!(
+                text.contains(prompt.as_str()),
+                "{}: {source} doesn't hold {prompt:?}",
+                model.name
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn bge_small_matches_sentence_transformers_and_transformers() {
+    check_references("bge-small");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn bge_base_matches_sentence_transformers_and_transformers() {
+    check_references("bge-base");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn e5_base_matches_sentence_transformers_and_transformers() {
+    check_references("e5-base");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn bge_large_matches_sentence_transformers_and_transformers() {
+    check_references("bge-large");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn mxbai_large_matches_sentence_transformers_and_transformers() {
+    check_references("mxbai-large");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn arctic_matches_sentence_transformers_and_transformers() {
+    check_references("arctic");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn minilm_matches_sentence_transformers_and_transformers() {
+    check_references("minilm");
 }

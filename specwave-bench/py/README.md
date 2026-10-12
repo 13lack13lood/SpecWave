@@ -11,8 +11,9 @@ go online.
 |---|---|
 | `export_beir.py` | Writes the FiQA (financial opinion mining and question answering) and Quora texts as JSON (JavaScript Object Notation) lines in parquet order, the cached embeddings as `.fbin`, the evaluation queries and their exact 100 nearest documents |
 | `spec_states.py` | Writes each layer's pooled states, the ridge predictions of the final embedding from them, and the k-means clusters |
-| `common.py` | Holds the file formats, the exact nearest-neighbor search, the ridge regression and the model runs that both share |
-| `test_common.py` | Tests `common.py`, and how the two scripts keep or remake their outputs, on small synthetic data |
+| `encoder_refs.py` | Writes the outputs of sentence-transformers and transformers that the Rust encoder's checks compare with, for each model of the models list |
+| `common.py` | Holds the file formats, the exact nearest-neighbor search, the ridge regression, the models list and the model runs that the scripts share |
+| `test_common.py` | Tests `common.py`, and how the first two scripts keep or remake their outputs, on small synthetic data |
 
 ## Running
 
@@ -20,6 +21,7 @@ go online.
 python3 export_beir.py --cache DIR   # DIR holds the cached .npy embeddings and the BeIR relevance judgments
 python3 spec_states.py fiqa          # or name steps, eg. spec_states.py fiqa timing
 python3 spec_states.py quora
+python3 encoder_refs.py              # or name models, eg. encoder_refs.py bge-small e5-base
 python3 test_common.py
 ```
 
@@ -87,3 +89,24 @@ prediction first, then copies `e.fbin` again whenever its bytes differ from `<ds
 once every prediction and the ground truth belong to the current evaluation queries, which `spec_coverage` checks before
 it measures. `export_beir.py` stops when kept test files hold other rows than its rule gives. `timing.json` isn't tied
 to the evaluation queries, since it only times the model.
+
+## Encoder References
+
+The models list is `specwave/src/encoder/models.json`, which the Rust encoder reads too. It names each model by a short
+name, eg. `bge-small`, and holds its layers that may fire and the prompts that its sentence-transformers settings leave
+out, with the file of the snapshot that gives them. `common.prompts` finds a model's query and passage prompts the way
+the encoder does, and checks that each listed prompt is in that file.
+
+`encoder_refs.py` writes `data/encoders/<name>/` for each model of the list whose snapshot is cached. It embeds the
+first 50 evaluation queries of `fiqa_test.jsonl` and 50 documents of `fiqa_corpus.jsonl`, drawn with seed 5 from those
+with text, on the processor in float32, one text at a time. The ignored tests of `specwave/tests/unit/encoder/candle.rs`
+read these files.
+
+| File | Contents |
+|---|---|
+| `<set>.jsonl` | The texts of set `queries` or `passages` as {row, text}, with each text's row in its source file |
+| `<set>.ids.ibin`, `<set>.lengths.ibin` | Every text's token ids, one text after another, and each text's token count |
+| `<set>.st.fbin` | sentence-transformers' embeddings, as the model gives them, so not always normalized |
+| `<set>.L<l>.fbin` | concat(mean over the tokens, first token) of hidden state l, for l = 0 to the last layer |
+| `queries.tokens.L<l>.fbin` | Every query token's hidden state l, one query after another |
+| `meta.json` | The model's settings and prompts, how far the files agree among themselves, and the versions |

@@ -557,6 +557,12 @@ fn the_command_line_takes_each_known_name_once_with_good_values() {
     );
     assert_eq!(s.model, "Snowflake/snowflake-arctic-embed-m-v1.5");
     assert_eq!(
+        parse(&with(&["--layers", "9:0:2", "--model", "bge-small"]))
+            .unwrap()
+            .model,
+        "BAAI/bge-small-en-v1.5"
+    );
+    assert_eq!(
         (s.out.clone(), s.models.clone()),
         ("/repo/results/spec.jsonl".into(), "/repo/models".into())
     );

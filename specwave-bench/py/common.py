@@ -31,6 +31,11 @@ MODELS = {
     "minilm": dict(repo="sentence-transformers/all-MiniLM-L6-v2", layers=6, dim=384, cls=False, prompt=None),
 }
 DATASETS = {"fiqa": "arctic", "quora": "minilm"}
+# The models list that the Rust encoder reads too, with each model's short name, its layers that may fire and the
+# prompts its sentence-transformers settings leave out.
+MODEL_LIST = os.path.join(REPO, "specwave", "src", "encoder", "models.json")
+# The names a passage prompt goes by in sentence-transformers' settings, in the order it tries them.
+PASSAGE_NAMES = ("document", "passage", "corpus")
 
 
 def path(*parts):
@@ -305,6 +310,53 @@ def openings(texts, n, seed, skip=()):
     out = [" ".join(texts[d].split()[:w]) for d, w in zip(docs, words)]
     kept = np.array([len(t.split()) for t in out])
     return docs, kept, out
+
+
+def listed_models():
+    """The entries of the models list, in its order."""
+    return read_json(MODEL_LIST)
+
+
+def listed(name):
+    """The entry of the models list whose short name or repository id is `name`."""
+    for entry in listed_models():
+        if name in (entry["name"], entry["repo"]):
+            return entry
+
+    raise KeyError(f"{name} isn't in {MODEL_LIST}")
+
+
+def snapshot(repo):
+    """The snapshot folder of the Hugging Face model `repo` in the local cache, the one that refs/main names."""
+    model = os.path.join(HUB, "models--" + repo.replace("/", "--"))
+
+    with open(os.path.join(model, "refs", "main"), encoding="utf-8") as f:
+        return os.path.join(model, "snapshots", f.read().strip())
+
+
+def prompts(entry):
+    """The query and passage prompts of the listed model `entry`, the way the Rust encoder finds them. Each comes from
+    the snapshot's sentence-transformers settings, else from the list, else it is empty. A listed prompt that the
+    settings give otherwise, or one missing from the file the list says it comes from, raises ValueError."""
+    folder = snapshot(entry["repo"])
+    file = os.path.join(folder, "config_sentence_transformers.json")
+    own = read_json(file).get("prompts", {}) if os.path.exists(file) else {}
+    source, text = entry.get("prompts_from"), ""
+
+    if source:
+        with open(os.path.join(folder, source), encoding="utf-8") as f:
+            text = f.read()
+
+    def pick(names, key):
+        found = next((own[n] for n in names if n in own), None)
+        given = entry.get(key)
+        if found is not None and given is not None and found != given:
+            raise ValueError(f"{entry['name']}: the list gives the prompt {given!r}, the snapshot {found!r}")
+        if given is not None and given not in text:
+            raise ValueError(f"{entry['name']}: {source} doesn't hold the prompt {given!r}")
+        return found if found is not None else (given or "")
+
+    return pick(("query",), "query_prompt"), pick(PASSAGE_NAMES, "passage_prompt")
 
 
 def device():
