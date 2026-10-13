@@ -14,6 +14,9 @@ import zlib
 from unittest import mock
 
 sys.dont_write_bytecode = True
+# Keeps every test away from the real data and results folders, even one that doesn't patch them.
+SCRATCH = tempfile.TemporaryDirectory()
+os.environ["SPECWAVE_DATA"] = os.environ["SPECWAVE_RESULTS"] = SCRATCH.name
 
 import numpy as np  # noqa: E402
 
@@ -23,6 +26,13 @@ import spec_states  # noqa: E402
 
 # The width of the synthetic embeddings.
 DIM = 8
+
+
+def fake_model(name):
+    """Stands in for c.model, with DIM dimensions, no prompts, and arctic's layers that may fire cut to 0 and 3."""
+    layers = {"arctic": 12, "minilm": 6}.get(name, 12)
+    return dict(name=name, repo=f"org/{name}", layers=layers, dim=DIM, fire=[0, 3] if name != "minilm" else [0, 1],
+                query_prompt="", passage_prompt="", model_type="bert")
 
 
 class Tables(unittest.TestCase):
@@ -232,29 +242,33 @@ class Steps(unittest.TestCase):
         """Runs spec_states.py's main with these steps. Returns the steps it started a process for, each with the
         marker it gave that process, and the steps it ran itself."""
         ran = []
-        env = {k: v for k, v in os.environ.items() if k != spec_states.CHILD}
-        if child:
-            env[spec_states.CHILD] = "1"
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(c, "DATA", d), \
-                mock.patch.object(c, "RESULTS", d), mock.patch.object(spec_states, "subprocess") as sp, \
-                mock.patch.dict(spec_states.STEP, {k: lambda ds, k=k: ran.append(k) for k in spec_states.STEPS}), \
-                mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(sys, "argv", ["spec_states.py", "fiqa", *steps]), \
-                contextlib.redirect_stdout(io.StringIO()):
-            spec_states.main()
+        with tempfile.TemporaryDirectory() as d:
+            env = {k: v for k, v in os.environ.items() if k != spec_states.CHILD}
+            env.update(SPECWAVE_DATA=d, SPECWAVE_RESULTS=d)
+            if child:
+                env[spec_states.CHILD] = "1"
+            steps_of = {k: lambda ds, name, k=k: ran.append((k, name)) for k in spec_states.STEPS}
+            with mock.patch.object(c, "DATA", d), mock.patch.object(c, "RESULTS", d), \
+                    mock.patch.object(c, "model", fake_model), mock.patch.object(spec_states, "subprocess") as sp, \
+                    mock.patch.dict(spec_states.STEP, steps_of), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(sys, "argv", ["spec_states.py", *steps]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                spec_states.main()
         started = [(run.args[0][2:], run.kwargs["env"].get(spec_states.CHILD)) for run in sp.run.call_args_list]
         return started, ran
 
     def test_each_step_runs_in_its_own_process(self):
-        started, ran = self.main("clusters", "states")
-        self.assertEqual(started, [(["fiqa", "states"], "1"), (["fiqa", "clusters"], "1")])
+        started, ran = self.main("fiqa", "clusters", "states")
+        self.assertEqual(started, [(["--model", "arctic", "fiqa", "states"], "1"),
+                                   (["--model", "arctic", "fiqa", "clusters"], "1")])
         self.assertEqual(ran, [])
-        started, ran = self.main()
-        self.assertEqual(started, [(["fiqa", step], "1") for step in spec_states.STEPS])
+        started, ran = self.main("--model", "BAAI/bge-small-en-v1.5", "fiqa")
+        self.assertEqual(started, [(["--model", "bge-small", "fiqa", step], "1") for step in spec_states.STEPS])
         self.assertEqual(ran, [])
 
     def test_a_child_runs_its_step(self):
-        self.assertEqual(self.main("ridge", child=True), ([], ["ridge"]))
+        self.assertEqual(self.main("fiqa", "ridge", child=True), ([], [("ridge", "arctic")]))
+        self.assertEqual(self.main("--model", "e5-base", "quora", "states", child=True), ([], [("states", "e5-base")]))
 
 
 def vec(text):
@@ -291,12 +305,11 @@ class Remake(unittest.TestCase):
         self.enterContext(mock.patch.object(c, "device", lambda: "cpu"))
         self.enterContext(mock.patch.object(c, "load_model", lambda name, dev: Model(name)))
         self.enterContext(mock.patch.object(c, "encode_states", self.encode))
-        self.enterContext(mock.patch.dict(c.MODELS["arctic"], dim=DIM))
-        self.enterContext(mock.patch.dict(c.MODELS["minilm"], dim=DIM))
+        self.enterContext(mock.patch.object(c, "model", fake_model))
+        self.enterContext(mock.patch.object(c, "pooling_of", lambda st: "cls"))
         self.enterContext(mock.patch.object(export_beir, "TEST_SIZE", 10))
         self.enterContext(mock.patch.object(export_beir, "GT_K", 20))
         self.enterContext(mock.patch.object(spec_states, "OPENINGS", 40))
-        self.enterContext(mock.patch.dict(spec_states.LAYERS, fiqa=[0, 3]))
         self.enterContext(mock.patch.dict(spec_states.SMALL_FIT, fiqa=20))
         self.enterContext(mock.patch.object(spec_states, "PROBE_SHARES", [0.34, 0.5]))
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
@@ -320,7 +333,7 @@ class Remake(unittest.TestCase):
             c.write_table(stem + ".parent_assign.ibin", (np.arange(6) % 2)[:, None], dtype="<i4")
             c.write_json(stem + ".json", dict(kind=kind, nlist=6))
 
-    def encode(self, st, texts, prompt, layers, states, final=None, cls=True, batch=64, max_len=128):
+    def encode(self, st, texts, prompt, layers, states, final=None, pooling="cls", batch=64, max_len=128):
         """Stands in for c.encode_states. Each layer's state is the text's vector twice plus noise that shrinks with
         the layer, and the final embedding is the vector itself."""
         self.encoded.append((st.name, list(texts)))
@@ -460,6 +473,28 @@ class Remake(unittest.TestCase):
         self.run_all()
         self.assertEqual(self.encoded, [])
         self.assertEqual({f: os.stat(f).st_mtime_ns for f in self.files()}, before)
+
+    def test_another_model_fits_its_own_layers_with_its_prompt_and_no_minilm(self):
+        other = dict(fake_model("bge-small"), fire=[0, 1, 3], query_prompt="Represent: ")
+        prompts, encode = [], self.encode
+
+        def recording(st, texts, prompt, *args, **kwargs):
+            prompts.append(prompt)
+            return encode(st, texts, prompt, *args, **kwargs)
+
+        with mock.patch.object(c, "model", lambda name: other if name == "bge-small" else fake_model(name)), \
+                mock.patch.object(c, "encode_states", recording):
+            self.export()
+            spec_states.states("fiqa", "bge-small")
+            spec_states.ridge("fiqa", "bge-small")
+            summary = spec_states.summary("fiqa", "bge-small")
+        stems = sorted(os.path.basename(f) for f in glob.glob(spec("ehat", "*.fbin")))
+        self.assertEqual(stems, sorted(f"{s}.L{layer}.fbin" for s in ("openings", "queries") for layer in (0, 1, 3)))
+        self.assertEqual({m for m, _ in self.encoded}, {"bge-small"})
+        self.assertEqual(set(prompts), {"Represent: "})
+        self.assertEqual(glob.glob(spec("states", "*minilm*")), [])
+        self.assertEqual((summary["model"], summary["layers"]), ("org/bge-small", [0, 1, 3]))
+        self.assertTrue(c.same_bytes(c.path("fiqa_test.fbin"), spec("e.fbin")))
 
     def test_e_stays_a_byte_copy_of_the_test_queries(self):
         self.run_all()

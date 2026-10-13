@@ -11,8 +11,10 @@ It writes these files under data/encoders/<name>/, for set queries or passages.
 - <set>.jsonl holds the texts as {row, text}, with each text's row in its source file.
 - <set>.ids.ibin holds every text's token ids, one text after another, and <set>.lengths.ibin each text's count.
 - <set>.st.fbin holds sentence-transformers' embeddings as the model gives them, so not always normalized.
-- <set>.L<l>.fbin holds concat(mean over the tokens, first token) of hidden state l, for l = 0 to L, where l = 0 is
-  the embedding output and L the last layer.
+- <set>.L<l>.fbin holds concat(mean over the tokens, pooling token) of hidden state l, for l = 0 to L, where l = 0 is
+  the embedding output and L the last layer. The pooling token is the first token, or the last one for a causal
+  model, eg. Qwen3, whose last token is the only one that sees the whole text. For Qwen3, state L comes after the
+  final norm, as transformers gives it.
 - queries.tokens.L<l>.fbin holds every query token's hidden state l, one query after another.
 - meta.json holds the model's settings, its prompts, how far the stored outputs agree among themselves, and the
   versions. For a model stored in another precision it also holds how close sentence-transformers' default run comes.
@@ -70,6 +72,7 @@ def run(st, prompt, items, every_token):
     import torch
 
     pooling = st[1].pooling_mode
+    token = -1 if st[0].auto_model.config.model_type in c.CAUSAL else 0
     out = dict(ids=[], st=[], layers=None, tokens=None, pooled_gap=0.0)
 
     with torch.inference_mode():
@@ -83,10 +86,10 @@ def run(st, prompt, items, every_token):
                 out["layers"] = [[] for _ in states]
                 out["tokens"] = [[] for _ in states]
             for layer, h in enumerate(states):
-                out["layers"][layer].append(np.concatenate([h.mean(0), h[0]]))
+                out["layers"][layer].append(np.concatenate([h.mean(0), h[token]]))
                 if every_token:
                     out["tokens"][layer].append(h)
-            last = states[-1][0] if pooling == "cls" else states[-1].mean(0)
+            last = {"cls": states[-1][0], "lasttoken": states[-1][-1]}.get(pooling, states[-1].mean(0))
             out["pooled_gap"] = max(out["pooled_gap"], float(1 - cosine(last, e[0])))
             out["ids"].append(enc["input_ids"][0].numpy())
             out["st"].append(e[0])
@@ -127,9 +130,10 @@ def refs(entry, sets):
     config = st[0].auto_model.config
     meta = dict(name=entry["name"], repo=entry["repo"], snapshot=os.path.basename(c.snapshot(entry["repo"])),
                 query_prompt=query, passage_prompt=passage, prompts_from=entry.get("prompts_from"),
-                model_type=config.model_type, layers=config.num_hidden_layers, dim=config.hidden_size,
-                pooling=st[1].pooling_mode, modules=[type(m).__name__ for m in st],
-                max_seq_length=st.max_seq_length, dtype=dtype, threads=THREADS,
+                model_type=config.model_type, model_class=type(st[0].auto_model).__name__,
+                layers=config.num_hidden_layers, dim=config.hidden_size, pooling=st[1].pooling_mode,
+                summary_token="last" if config.model_type in c.CAUSAL else "first",
+                modules=[type(m).__name__ for m in st], max_seq_length=st.max_seq_length, dtype=dtype, threads=THREADS,
                 normalizer=str(st.tokenizer.backend_tokenizer.normalizer), versions=dict(
                     sentence_transformers=sentence_transformers.__version__, transformers=transformers.__version__,
                     torch=torch.__version__))

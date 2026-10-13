@@ -1,33 +1,41 @@
 """Exports two BeIR (Benchmarking Information Retrieval) datasets for the Rust benchmarks, FiQA (financial opinion
-mining and question answering) with its snowflake-arctic-embed-m-v1.5 embeddings and Quora with its all-MiniLM-L6-v2
-embeddings.
+mining and question answering) and Quora, with the embeddings of one model of the models list. By default that is
+each dataset's own model, snowflake-arctic-embed-m-v1.5 for FiQA and all-MiniLM-L6-v2 for Quora.
 
-For each dataset it writes these files under data/.
+For each dataset it writes these files under data/, or under data/models/<name>/ for another model.
 - <ds>_corpus.jsonl and <ds>_queries.jsonl hold every document and every query as {row, id, text}, in the order of the
   BeIR parquet files. JSON (JavaScript Object Notation) lines hold one record per line.
-- <ds>_corpus.fbin and <ds>_queries.fbin hold the cached normalized embeddings of the same rows. The queries were
-  embedded with the model's query prompt, if it has one.
+- <ds>_corpus.fbin and <ds>_queries.fbin hold the normalized embeddings of the same rows, cached or made here. The
+  documents were embedded with the model's passage prompt and the queries with its query prompt, if it has them.
 - <ds>_queries.splits.json holds the query rows of each BeIR split whose relevance judgments are in the cache.
 - <ds>_test.jsonl, <ds>_test.fbin and <ds>_test.meta.json hold the evaluation queries, their embeddings, the rows they
   come from and the seed.
 - <ds>_test.gt.ibin holds the 100 documents nearest each evaluation query by cosine, nearest first, with ties going to
   the lower row. <ds>_test.gt.json says how it was checked and records test_rows_sha256, the SHA-256 (Secure Hash
   Algorithm) hash of the evaluation queries' rows in <ds>_queries.
+- <ds>_<part>.embed.json says how the embeddings of part corpus or queries were made, for those made here.
 - <ds>_export.json holds the counts and the checks that row i of each .fbin file embeds row i of its .jsonl file.
 
 FiQA's evaluation queries are the first 1,000 of a permutation of all its queries with seed 11, then the queries of
 its BeIR test split that are not among them, in parquet order. Quora's are 1,000 queries of its BeIR test split, drawn
-with seed 11.
+with seed 11. They don't depend on the model, and neither do the texts, so a model's own folder links those files from
+data/ when data/ has them.
 
-Usage: export_beir.py --cache DIR [fiqa] [quora]
+Embeddings that aren't cached are made here in float32, each text cut at 512 tokens, or at the model's own limit if it
+is lower. That is the limit of the BERT (Bidirectional Encoder Representations from Transformers) models, so every
+model reads as much of each document. They are made 4,096 texts at a time, and each finished part is saved at once, so
+a stopped run makes only the parts that are missing.
+
+Usage: export_beir.py --cache DIR [--model NAME] [fiqa] [quora]
 
 DIR holds the cached embeddings, eg. fiqa_corpus_arctic.npy and fiqa_queries_arctic.npy, the corpus ids they were made
 with, eg. fiqa_corpus_ids.json, and the BeIR relevance judgments, eg. quora_dev.tsv. It can also come from
-$SPECWAVE_CACHE. A query file that isn't cached is embedded again. Outputs that exist are skipped, so delete one to
-make it again. The ground truth is also made again whenever the hash it records differs from the one of the rows in
+$SPECWAVE_CACHE. NAME is a short name of the models list, eg. bge-small. Outputs that exist are skipped, so delete one
+to make it again. The ground truth is also made again whenever the hash it records differs from the one of the rows in
 <ds>_test.meta.json."""
 import argparse
 import os
+import shutil
 import sys
 import time
 
@@ -47,6 +55,13 @@ CHUNK = 100_000
 CHECK_ROWS = 48
 CHECK_SEED = 5
 MIN_COS = 0.999
+# The most tokens of a text that a model reads here.
+MAX_TOKENS = 512
+# The texts in each saved part of an embedding made here, and in each batch of the model.
+PART = 4096
+BATCH = 32
+# The files of a dataset that don't depend on the model.
+TEXTS = ("corpus.jsonl", "queries.jsonl", "queries.splits.json", "test.jsonl", "test.meta.json")
 
 
 def write_texts(file, ids, texts):
@@ -55,6 +70,20 @@ def write_texts(file, ids, texts):
 
     c.write_jsonl(file, ({"row": i, "id": d, "text": t} for i, (d, t) in enumerate(zip(ids, texts))))
     print("wrote", file, len(ids), flush=True)
+
+
+def link_texts(ds):
+    """Links the texts and the evaluation queries of `ds` from data/ into another model's folder, where it lacks them.
+    A file that data/ doesn't have is made here instead."""
+    if os.path.realpath(c.DATA) == os.path.realpath(c.SHARED_DATA):
+        return
+
+    os.makedirs(c.DATA, exist_ok=True)
+
+    for part in TEXTS:
+        src, dst = os.path.join(c.SHARED_DATA, f"{ds}_{part}"), c.path(f"{ds}_{part}")
+        if os.path.exists(src) and not os.path.lexists(dst):
+            os.symlink(src, dst)
 
 
 def check_ids(ids, file):
@@ -82,26 +111,77 @@ def convert(src, dst, n, dim):
     print("wrote", dst, x.shape, flush=True)
 
 
-def embed(st, texts, prompt_name):
-    """Normalized embeddings of `texts`, made the way the cached ones were."""
-    kw = dict(prompt_name=prompt_name) if prompt_name else {}
-    e = st.encode(texts, batch_size=32, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False, **kw)
+def load(name):
+    """The model `name` on the fastest device here, reading at most MAX_TOKENS tokens of each text."""
+    st = c.load_model(name, c.device())
+    st.max_seq_length = min(st.max_seq_length or MAX_TOKENS, MAX_TOKENS)
+    return st
+
+
+def embed(st, texts, prompt):
+    """Normalized embeddings of `texts`, each read after the literal text `prompt`."""
+    e = st.encode(texts, prompt=prompt, batch_size=BATCH, normalize_embeddings=True, convert_to_numpy=True,
+                  show_progress_bar=False)
     return e.astype(np.float32)
 
 
-def embed_queries(dst, name, texts):
-    """Embeds every query when the cache has no embeddings of them."""
+def save_part(file, rows):
+    with open(file + ".part", "wb") as f:
+        np.save(f, rows)
+
+    os.replace(file + ".part", file)
+
+
+def embed_table(dst, st, name, texts, prompt):
+    """Embeds `texts` after `prompt` with model `name` into the .fbin file `dst`, PART texts at a time. Each part goes
+    to <dst>.parts/ as soon as it is done, with the settings it was made with, and the parts are joined once they are
+    all there. Parts made with other settings are made again. Writes the settings and the model's seconds to
+    <stem>.embed.json, next to `dst`."""
     if os.path.exists(dst):
         return
 
-    st = c.load_model(name, c.device())
-    out = c.new_table(dst, len(texts), c.MODELS[name]["dim"])
+    import torch
 
-    for s in range(0, len(texts), 4096):
-        out[s:s + 4096] = embed(st, texts[s:s + 4096], c.MODELS[name]["prompt"])
+    folder, info_file = dst + ".parts", dst[:-len(".fbin")] + ".embed.json"
+    dev = next(st.parameters()).device
+    settings = dict(model=c.model(name)["repo"], prompt=prompt, rows=len(texts), part=PART, batch=BATCH,
+                    max_tokens=st.max_seq_length, dtype=str(next(st.parameters()).dtype), normalized=True)
+
+    if os.path.isdir(folder) and not c.up_to_date([], os.path.join(folder, "settings.json"), **settings):
+        shutil.rmtree(folder)
+
+    os.makedirs(folder, exist_ok=True)
+    c.write_json(os.path.join(folder, "settings.json"), settings)
+    starts = range(0, len(texts), PART)
+
+    for s in starts:
+        file = os.path.join(folder, f"{s:08d}.npy")
+        if os.path.exists(file):
+            continue
+        t = time.time()
+        rows = embed(st, texts[s:s + PART], prompt)
+        save_part(file, rows)
+        c.write_json(file[:-len(".npy")] + ".json", dict(seconds=round(time.time() - t, 2), device=dev.type))
+        print(os.path.basename(dst), f"rows {s} to {s + len(rows)} of {len(texts)} in {time.time() - t:.0f}s",
+              flush=True)
+        if dev.type == "mps":
+            torch.mps.empty_cache()
+
+    dim = st.get_embedding_dimension()
+    out = c.new_table(dst, len(texts), dim)
+    seconds = 0.0
+
+    for s in starts:
+        rows = np.load(os.path.join(folder, f"{s:08d}.npy"))
+        if rows.shape != (min(PART, len(texts) - s), dim) or rows.dtype != np.float32:
+            raise ValueError(f"{folder} has a part of {rows.dtype} {rows.shape} at row {s}, so delete it")
+        out[s:s + len(rows)] = rows
+        seconds += c.read_json(os.path.join(folder, f"{s:08d}.json"))["seconds"]
 
     c.finish(dst, out)
-    print("embedded", dst, len(texts), flush=True)
+    c.write_json(info_file, dict(settings, device=dev.type, seconds=round(seconds, 1), parts=len(starts)))
+    shutil.rmtree(folder)
+    print("embedded", dst, len(texts), f"{seconds:.0f}s", flush=True)
 
 
 def stats(file):
@@ -224,21 +304,22 @@ def ground_truth(ds):
     return info
 
 
-def check(ds, name):
-    """Embeds a sample of rows of each .jsonl file again and compares them with the same rows of its .fbin file."""
-    st = c.load_model(name, c.device())
-    prompt = c.MODELS[name]["prompt"]
+def check(ds, name, st=None):
+    """Embeds a sample of rows of each .jsonl file again, with the prompt of its part, and compares them with the same
+    rows of its .fbin file."""
+    st = st or load(name)
+    m = c.model(name)
     rng = np.random.default_rng(CHECK_SEED)
     out = {}
 
-    for part, prompt_name in (("corpus", None), ("queries", prompt), ("test", prompt)):
+    for part, prompt in (("corpus", m["passage_prompt"]), ("queries", m["query_prompt"]), ("test", m["query_prompt"])):
         recs = c.read_jsonl(c.path(f"{ds}_{part}.jsonl"))
         vecs = c.open_table(c.path(f"{ds}_{part}.fbin"))
         n = len(recs)
         if n != len(vecs) or any(r["row"] != i for i, r in enumerate(recs)):
             raise ValueError(f"{ds}_{part}.jsonl and .fbin don't have the same rows")
         rows = np.unique(np.concatenate([[0, n - 1], rng.choice(n, CHECK_ROWS - 2, replace=False)]))
-        e = embed(st, [recs[i]["text"] for i in rows], prompt_name)
+        e = embed(st, [recs[i]["text"] for i in rows], prompt)
         cos = np.sum(e * vecs[rows], 1)
         shifted = np.sum(e * vecs[(rows + 1) % n], 1)
         out[part] = dict(rows_checked=len(rows), min_cos=float(cos.min()), mean_cos=float(cos.mean()),
@@ -250,38 +331,45 @@ def check(ds, name):
     return out
 
 
-def export(ds, cache):
-    name = c.DATASETS[ds]
-    dim = c.MODELS[name]["dim"]
+def export(ds, cache, name):
+    """Exports `ds` with the listed model `name` into the data folder, which `c.use_model` points at that model's."""
+    m = c.model(name)
     t = time.time()
+    link_texts(ds)
     ids, texts = c.beir(ds, "corpus")
     check_ids(ids, os.path.join(cache, f"{ds}_corpus_ids.json"))
     write_texts(c.path(f"{ds}_corpus.jsonl"), ids, texts)
-    convert(os.path.join(cache, f"{ds}_corpus_{name}.npy"), c.path(f"{ds}_corpus.fbin"), len(ids), dim)
     qids, qtexts = c.beir(ds, "queries")
     check_ids(qids, os.path.join(cache, f"{ds}_query_ids.json"))
     write_texts(c.path(f"{ds}_queries.jsonl"), qids, qtexts)
-    cached = os.path.join(cache, f"{ds}_queries_{name}.npy")
+    st = None
 
-    if os.path.exists(cached):
-        convert(cached, c.path(f"{ds}_queries.fbin"), len(qids), dim)
-    else:
-        embed_queries(c.path(f"{ds}_queries.fbin"), name, qtexts)
+    for part, items, prompt in (("corpus", texts, m["passage_prompt"]), ("queries", qtexts, m["query_prompt"])):
+        cached, dst = os.path.join(cache, f"{ds}_{part}_{name}.npy"), c.path(f"{ds}_{part}.fbin")
+        if os.path.exists(cached):
+            convert(cached, dst, len(items), m["dim"])
+        elif not os.path.exists(dst):
+            st = st or load(name)
+            embed_table(dst, st, name, items, prompt)
 
     split = splits(ds, cache, qids)
-    report = dict(dataset=ds, model=c.MODELS[name]["repo"], query_prompt=c.MODELS[name]["prompt"],
+    infos = {p: c.path(f"{ds}_{p}.embed.json") for p in ("corpus", "queries")}
+    made_here = {p: c.read_json(f) for p, f in infos.items() if os.path.exists(f)}
+    report = dict(dataset=ds, model=m["repo"], name=name, query_prompt=m["query_prompt"],
+                  passage_prompt=m["passage_prompt"], embedded_here=made_here,
                   corpus=stats(c.path(f"{ds}_corpus.fbin")), queries=stats(c.path(f"{ds}_queries.fbin")),
                   splits={k: len(v) for k, v in split.items()}, test=test_set(ds, qids, qtexts, split))
     report["gt"] = ground_truth(ds)
-    report["checks"] = check(ds, name)
+    report["checks"] = check(ds, name, st)
     report["seconds"] = round(time.time() - t, 1)
     c.write_json(c.path(f"{ds}_export.json"), report)
-    print("done", ds, f"{report['seconds']:.0f}s", flush=True)
+    print("done", ds, name, f"{report['seconds']:.0f}s", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Export FiQA and Quora texts, embeddings, query sets and ground truth.")
     ap.add_argument("--cache", default=os.environ.get("SPECWAVE_CACHE"), help="the folder of cached embeddings")
+    ap.add_argument("--model", help="a short name of the models list, each dataset's own model by default")
     ap.add_argument("datasets", nargs="*", help="fiqa, quora or both (the default)")
     a = ap.parse_args()
     datasets = a.datasets or ["fiqa", "quora"]
@@ -293,7 +381,11 @@ def main():
         ap.error(f"datasets are {', '.join(c.DATASETS)}")
 
     for ds in datasets:
-        export(ds, a.cache)
+        try:
+            name = c.use_model(a.model or c.DATASETS[ds], ds)
+        except KeyError as e:
+            ap.error(str(e))
+        export(ds, a.cache, name)
 
 
 if __name__ == "__main__":

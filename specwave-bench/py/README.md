@@ -14,6 +14,7 @@ go online.
 | `encoder_refs.py` | Writes the outputs of sentence-transformers and transformers that the Rust encoder's checks compare with, for each model of the models list |
 | `common.py` | Holds the file formats, the exact nearest-neighbor search, the ridge regression, the models list and the model runs that the scripts share |
 | `test_common.py` | Tests `common.py`, and how the first two scripts keep or remake their outputs, on small synthetic data |
+| `test_models.py` | Tests how the scripts serve any model of the models list: its folders, settings, prompts, pooling and layer summaries, and the embeddings the export makes and resumes |
 
 ## Running
 
@@ -21,19 +22,43 @@ go online.
 python3 export_beir.py --cache DIR   # DIR holds the cached .npy embeddings and the BeIR relevance judgments
 python3 spec_states.py fiqa          # or name steps, eg. spec_states.py fiqa timing
 python3 spec_states.py quora
+python3 export_beir.py --cache DIR --model bge-small fiqa   # another model of the models list, in its own folders
+python3 spec_states.py --model bge-small fiqa
 python3 encoder_refs.py              # or name models, eg. encoder_refs.py bge-small e5-base
 python3 test_common.py
+python3 test_models.py
 ```
 
 Each step of `spec_states.py` runs in its own process, named or not, since faiss and PyTorch load clashing copies of
 the OpenMP (Open Multi-Processing) runtime.
+
+## Models
+
+`--model` takes a short name of the models list, eg. `bge-small`, or a repository id. Each dataset's own model is the
+default, arctic for FiQA and MiniLM for Quora, and its files are the ones in `data/` and `results/`. Any other model
+gets folders of its own, `data/models/<name>/` and `results/models/<name>/`, laid out like `data/` and `results/`.
+`$SPECWAVE_DATA` and `$SPECWAVE_RESULTS` name other folders, but never the shared ones for another model. The texts
+and the evaluation queries don't depend on the model, so the export links them from `data/`.
+
+The layers that get predictors come from the list, and the sizes, the pooling and the prompts from the model's
+snapshot or the list, as `common.model` and `common.prompts` find them. Every model runs in float32. The prompts are
+passed as their text, since sentence-transformers' prompt names give no prompt for a model whose settings hold none,
+eg. bge. A layer's summary ends with the first (CLS) token, or with the last token for a causal model, eg. Qwen3,
+whose last token is the end-of-text token its tokenizer appends. nomic-embed-text-v1.5 runs on transformers' own
+nomic-bert code, which gives the same embeddings and states as the code its snapshot points at. transformers 5
+can't run that code.
+
+The export embeds a model's documents with its passage prompt and its queries with its query prompt, each text cut at
+512 tokens, or at the model's own limit if it is lower, so every model reads as much of each document. It saves them
+4,096 texts at a time in `<ds>_<part>.fbin.parts/`, so a stopped run makes only the parts that are missing, and
+`<ds>_<part>.embed.json` says how they were made. The MiniLM fit to arctic's embedding is made for arctic on FiQA only.
 
 ## Files
 
 Vectors are `.fbin` files and integers `.ibin` files, both an int32 row count and an int32 width, then the rows as
 little-endian float32 or int32 values. Row i of a `.jsonl` file is row i of the `.fbin` file with the same stem. FiQA
 uses snowflake-arctic-embed-m-v1.5 (768 dimensions, the CLS (classification) token, a query prompt) and Quora all-MiniLM-L6-v2 (384
-dimensions, the token mean, no prompt). Every embedding is normalized.
+dimensions, the token mean, no prompt), unless `--model` names another model. Every embedding is normalized.
 
 In `data/`, for `<ds>` fiqa or quora:
 
@@ -62,7 +87,7 @@ In `data/spec/<ds>/`, where layer l is the hidden state after l transformer laye
 | `openings.jsonl` | The 20,000 document openings, i.e. the first 6 to 24 words, drawn with seed 12, as {row, doc, id, words, text} |
 | `queries.jsonl` | The real training queries, all other queries for FiQA and the BeIR dev split for Quora, in parquet order |
 | `openings.meta.json`, `queries.meta.json` | How each training set was drawn |
-| `states/<set>.L<l>.fbin` | The pooled states (n × 2d, the masked mean then the CLS vector) of set openings, queries or test |
+| `states/<set>.L<l>.fbin` | The layer summaries (n × 2d, the masked mean then the CLS vector, or the last token's for a causal model) of set openings, queries or test |
 | `states/<set>.final.fbin` | The same texts' final embeddings, the ridge targets |
 | `clusters/<kind>.centroids.fbin` | N/160 cluster centers for N documents, from L2 (Euclidean, `l2`) or spherical (`sph`) k-means with seed 1 |
 | `clusters/<kind>.assign.ibin` | Each document's cluster, one per row |
@@ -71,12 +96,12 @@ In `data/spec/<ds>/`, where layer l is the hidden state after l transformer laye
 | `timing.json` | The time to each layer at batch 1 on the processor with 4 threads |
 | `summary.json` | All of the numbers above in one file |
 
-Fit is `openings`, which needs no query log, or `queries`. The layers are 0, 3, 6, 8, 9 and 10 of arctic's 12, and 0,
-1, 3, 4 and 5 of MiniLM's 6. The penalty is the one that, fitted on the first 85% of the training pairs, best predicts
-the last 15%. The openings are in random draw order already. The real queries are in parquet order, where the BeIR
-splits sit in blocks, so their pairs are shuffled with seed 13 before this split. The cluster files map to coldivf's
-`Clusters`: `centroids`, `assignment`, `parents` and `parent_of`. `results/spec_states.jsonl` gets one line per run
-that made something new.
+Fit is `openings`, which needs no query log, or `queries`. The layers are the models list's, eg. 0, 3, 6, 8, 9 and 10 of
+arctic's 12, and 0, 1, 3, 4 and 5 of MiniLM's 6. The penalty is the one that, fitted on the first 85% of the training
+pairs, best predicts the last 15%. The openings are in random draw order already. The real queries are in parquet
+order, where the BeIR splits sit in blocks, so their pairs are shuffled with seed 13 before this split. The cluster
+files map to coldivf's `Clusters`: `centroids`, `assignment`, `parents` and `parent_of`. `spec_states.jsonl` in the
+model's results folder gets one line per run that made something new.
 
 ## Evaluation Ids
 

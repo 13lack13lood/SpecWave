@@ -1,57 +1,60 @@
 """Computes the layer states and the ridge predictors that SpecWave starts its early reads with, plus the cluster files
-of the Rust benchmarks, for FiQA (financial opinion mining and question answering) with snowflake-arctic-embed-m-v1.5
-and Quora with all-MiniLM-L6-v2. It reads the exports of export_beir.py.
+of the Rust benchmarks, for FiQA (financial opinion mining and question answering) or Quora with one model of the
+models list. By default that is each dataset's own model, snowflake-arctic-embed-m-v1.5 for FiQA and all-MiniLM-L6-v2
+for Quora. It reads the exports of export_beir.py, from data/ or, for another model, from data/models/<name>/.
 
-Layer l is the hidden state after l transformer layers, and l = 0 is the embedding output. Its pooled state is the
-mean over the attention mask followed by the CLS (classification token) vector, so 2d values for a model of d
-dimensions. Every input is encoded with at most 128 tokens and the model's query prompt, if it has one. The inputs
-are these.
+Layer l is the hidden state after l transformer layers, and l = 0 is the embedding output. Its summary is the mean over
+the attention mask followed by the vector of one token, so 2d values for a model of d dimensions. That token is the
+CLS (classification) token, the first one, or the last token for a causal model, eg. Qwen3, whose last token is the only
+one that sees the whole text. Every input is encoded in float32 with at most 128 tokens and the model's query prompt, if
+it has one. The inputs are these.
 - The evaluation queries of export_beir.py.
 - Real queries outside them, all the other queries for FiQA and the BeIR (Benchmarking Information Retrieval) dev
   split for Quora.
 - The openings of 20,000 random documents, i.e. each one's first 6 to 24 words, a uniform draw per document.
 
-For each layer, a ridge regression from the pooled state to the final embedding predicts the evaluation queries' final
-embeddings. It is fitted once on the openings, which need no query log, and once on the real queries, which bound what
-a query log could give. X is standardized and Y centered. Of the penalties 1e-3, 1e-2 and 1e-1, the one that fitted on
-the first 85% of the pairs best predicts the last 15% is fitted again on all of them. The openings are in random draw
-order already. The real queries are in parquet order, where the BeIR splits sit in blocks, so their pairs are shuffled
-with seed 13 before this split. For FiQA it also fits MiniLM's last layer state to arctic's final embedding, so a
-second, smaller model can make the prediction.
+For each layer that may fire, as the models list gives them, a ridge regression from the summary to the final
+embedding predicts the evaluation queries' final embeddings. It is fitted once on the openings, which need no query
+log, and once on the real queries, which bound what a query log could give. X is standardized and Y centered. Of the
+penalties 1e-3, 1e-2 and 1e-1, the one that fitted on the first 85% of the pairs best predicts the last 15% is fitted
+again on all of them. The openings are in random draw order already. The real queries are in parquet order, where the
+BeIR splits sit in blocks, so their pairs are shuffled with seed 13 before this split. For arctic on FiQA it also fits
+MiniLM's last layer state to arctic's final embedding, so a second, smaller model can make the prediction.
 
 The clusters come from k-means in faiss, the similarity search library, over the corpus embeddings, with N/160
 clusters for N documents. They are made twice, with plain L2 (Euclidean distance) k-means and with spherical k-means,
 each with groups of nearby clusters from a k-means over the cluster centers.
 
-It writes these files under data/spec/<ds>/.
+It writes these files under spec/<ds>/ in the model's data folder.
 - openings.jsonl and queries.jsonl hold the training texts, eg. {row, doc, id, words, text} per opening.
   openings.meta.json and queries.meta.json say how they were drawn.
 - states/<set>.L<l>.fbin (n × 2d) and states/<set>.final.fbin (n × d, normalized) hold the states of each set, i.e.
-  openings, queries or test. For FiQA, states/<set>.minilm.L6.fbin holds MiniLM's last layer state.
-- e.fbin is a byte copy of data/<ds>_test.fbin, the evaluation queries' final embeddings, which the ridge step writes
+  openings, queries or test. For arctic on FiQA, states/<set>.minilm.L6.fbin holds MiniLM's last layer state.
+- e.fbin is a byte copy of <ds>_test.fbin, the evaluation queries' final embeddings, which the ridge step writes
   last.
 - ehat/<fit>.L<l>.fbin holds the normalized predictions for the evaluation queries, in the same row order, for fit
-  openings or queries. For FiQA, ehat/minilm.<fit>.fbin holds MiniLM's predictions. Each has a .json file.
+  openings or queries. For arctic on FiQA, ehat/minilm.<fit>.fbin holds MiniLM's predictions. Each has a .json file.
 - clusters/<kind>.centroids.fbin, <kind>.assign.ibin (each document's cluster), <kind>.parents.fbin (the group
   centers) and <kind>.parent_assign.ibin (each cluster's group) hold the clusters, for kind l2 or sph. <kind>.json
   holds the settings and the cluster sizes, and <kind>.ceiling.json the recall of an exact scan of the clusters each
   evaluation query probes. The query picks them by L2 distance (l2) or by the raw inner product with the centers as
   they are (ip-raw).
 - timing.json holds the time to each layer on the processor at batch 1.
-- summary.json holds the numbers of all of these. results/spec_states.jsonl gets a line per run that made something.
+- summary.json holds the numbers of all of these. spec_states.jsonl in the model's results folder, results/ or
+  results/models/<name>/, gets a line per run that made something.
 
 Every output made from the evaluation queries records test_rows_sha256 in its .json file, the SHA-256 (Secure Hash
-Algorithm) hash of their rows in data/<ds>_queries. A step makes such an output again when that hash differs from the
-one of data/<ds>_test.meta.json, and stops when an input from an earlier step has another hash. The ridge step also
-checks the ground truth's hash. It makes every prediction first, then copies e.fbin again whenever its bytes differ
-from data/<ds>_test.fbin. So the two files match only once every prediction and the ground truth belong to the current
+Algorithm) hash of their rows in <ds>_queries. A step makes such an output again when that hash differs from the one
+of <ds>_test.meta.json, and stops when an input from an earlier step has another hash. The ridge step also checks the
+ground truth's hash. It makes every prediction first, then copies e.fbin again whenever its bytes differ from
+<ds>_test.fbin. So the two files match only once every prediction and the ground truth belong to the current
 evaluation queries, which the Rust benchmarks check. Other outputs that exist are skipped, so delete one to make it
 again.
 
-Usage: spec_states.py fiqa|quora [states] [ridge] [clusters] [timing]
+Usage: spec_states.py [--model NAME] fiqa|quora [states] [ridge] [clusters] [timing]
 
-With no step it runs them all. Each step runs in its own process, named or not, since faiss and PyTorch load clashing
-copies of the OpenMP (Open Multi-Processing) runtime."""
+NAME is a short name of the models list, eg. bge-small. With no step it runs them all. Each step runs in its own
+process, named or not, since faiss and PyTorch load clashing copies of the OpenMP (Open Multi-Processing) runtime."""
 import argparse
 import os
 import subprocess
@@ -67,7 +70,6 @@ import numpy as np  # noqa: E402
 
 import common as c  # noqa: E402
 
-LAYERS = {"fiqa": [0, 3, 6, 8, 9, 10], "quora": [0, 1, 3, 4, 5]}
 OPENINGS = 20_000
 OPENING_SEED = 12
 # A fit on fewer openings shows how much the cosine gains from more training pairs.
@@ -75,6 +77,9 @@ SMALL_FIT = {"fiqa": 8000, "quora": 10_000}
 LAMBDAS = [1e-3, 1e-2, 1e-1]
 # The seed that shuffles a training set's pairs before the penalty's validation split, or None for no shuffle.
 SPLIT_SEED = {"openings": None, "queries": 13}
+# The smaller model whose last layer state is also fitted to the final embedding, for the dataset and the model it
+# serves.
+SMALLER = {("fiqa", "arctic"): "minilm"}
 MAX_LEN = 128
 VECTORS_PER_LIST = 160
 # Probe shares of the clusters, eg. 0.0256 of 360 clusters is 9.
@@ -124,26 +129,32 @@ def training_sets(ds, made):
     }
 
 
-def state_infos(ds):
+def own(ds, name):
+    """The listed model `name`, the dataset's own model when it is None."""
+    return name or c.DATASETS[ds]
+
+
+def state_infos(ds, name=None):
     """The .json file of each set's states, for each model that encodes the sets."""
-    tags = ["", "minilm."] if ds == "fiqa" else [""]
+    tags = ["", f"{SMALLER[ds, own(ds, name)]}."] if (ds, own(ds, name)) in SMALLER else [""]
     return [spec(ds, "states", f"{s}.{tag}json") for tag in tags for s in ("openings", "queries", "test")]
 
 
-def states(ds):
-    """Encodes every set with the dataset's model, and for FiQA also with MiniLM, writing the pooled states. A set is
+def states(ds, name=None):
+    """Encodes every set with the model `name`, and for arctic on FiQA also with MiniLM, writing the summaries. A set is
     encoded again when its states were made for other evaluation queries."""
-    name = c.DATASETS[ds]
+    name = own(ds, name)
     made = c.evaluation_id(ds)
     sets = training_sets(ds, made)
-    runs = [(name, "", LAYERS[ds], True)]
+    runs = [(name, "", c.model(name)["fire"], True)]
 
-    if ds == "fiqa":
-        runs.append(("minilm", "minilm.", [c.MODELS["minilm"]["layers"]], False))
+    if (ds, name) in SMALLER:
+        smaller = SMALLER[ds, name]
+        runs.append((smaller, f"{smaller}.", [c.model(smaller)["layers"]], False))
 
     for model, tag, layers, with_final in runs:
         st = None
-        cfg = c.MODELS[model]
+        cfg = c.model(model)
         for set_name, texts in sets.items():
             files = {layer: spec(ds, "states", f"{set_name}.{tag}L{layer}.fbin") for layer in layers}
             final = spec(ds, "states", f"{set_name}.final.fbin") if with_final else None
@@ -151,19 +162,21 @@ def states(ds):
             if c.up_to_date([f for f in [*files.values(), final] if f], info_file, **made):
                 continue
             st = st or c.load_model(model, c.device())
-            prompt = c.prompt_of(st, model)
+            prompt, pooling = cfg["query_prompt"], c.pooling_of(st)
             sinks = {layer: c.new_table(f, len(texts), 2 * cfg["dim"]) for layer, f in files.items()}
             final_sink = c.new_table(final, len(texts), cfg["dim"]) if final else None
             t = time.time()
-            lengths = c.encode_states(st, texts, prompt, layers, sinks, final_sink, cls=cfg["cls"], max_len=MAX_LEN)
+            lengths = c.encode_states(st, texts, prompt, layers, sinks, final_sink, pooling=pooling, max_len=MAX_LEN)
             took = time.time() - t
             for layer, f in files.items():
                 c.finish(f, sinks[layer])
             if final:
                 c.finish(final, final_sink)
+            token = "last" if cfg["model_type"] in c.CAUSAL else "first"
             info = dict(made, model=cfg["repo"], rows=len(texts), layers=layers, prompt=prompt, max_len=MAX_LEN,
-                        tokens_mean=float(np.mean(lengths)), at_max_len=int(np.sum(lengths >= MAX_LEN)),
-                        seconds=round(took, 1), texts_per_second=round(len(texts) / took, 1))
+                        pooling=pooling, summary_token=token, tokens_mean=float(np.mean(lengths)),
+                        at_max_len=int(np.sum(lengths >= MAX_LEN)), seconds=round(took, 1),
+                        texts_per_second=round(len(texts) / took, 1))
             c.write_json(info_file, info)
             print(ds, model, set_name, f"{len(texts)} texts in {took:.0f}s", flush=True)
 
@@ -200,12 +213,13 @@ def predict(stem, made, X, Y, Z, e, subsets):
     print(os.path.basename(stem), f"lam={info['lam']} cos={info['cos']:.4f}", flush=True)
 
 
-def ridge(ds):
+def ridge(ds, name=None):
     """Fits every predictor and writes its predictions for the evaluation queries. It stops when the states or the
     ground truth were made for other evaluation queries, and it writes e.fbin last. So e.fbin holds the bytes of
-    data/<ds>_test.fbin only once a ridge step has finished with the current evaluation queries."""
+    <ds>_test.fbin only once a ridge step has finished with the current evaluation queries."""
+    name = own(ds, name)
     made = c.evaluation_id(ds)
-    stale = [os.path.basename(f)[:-len(".json")] for f in state_infos(ds) if not c.up_to_date([], f, **made)]
+    stale = [os.path.basename(f)[:-len(".json")] for f in state_infos(ds, name) if not c.up_to_date([], f, **made)]
 
     if stale:
         raise ValueError(f"the {', '.join(stale)} states weren't made for {ds}'s evaluation queries, so run the states"
@@ -224,21 +238,23 @@ def ridge(ds):
         raise ValueError(f"the final embeddings of the test states differ from {ds}_test.fbin (cosine {agree.min()})")
 
     targets = {s: table(spec(ds, "states", f"{s}.final.fbin")) for s in ("openings", "queries")}
+    fire = c.model(name)["fire"]
 
     for fit_set, Y in targets.items():
         split = dict(made, split_seed=SPLIT_SEED[fit_set])
-        for layer in LAYERS[ds]:
+        for layer in fire:
             X = table(spec(ds, "states", f"{fit_set}.L{layer}.fbin"))
             Z = table(spec(ds, "states", f"test.L{layer}.fbin"))
             predict(spec(ds, "ehat", f"{fit_set}.L{layer}"), split, X, Y, Z, e, subsets)
 
-    if ds == "fiqa":
-        last = c.MODELS["minilm"]["layers"]
-        Z = table(spec(ds, "states", f"test.minilm.L{last}.fbin"))
+    if (ds, name) in SMALLER:
+        smaller = SMALLER[ds, name]
+        last = c.model(smaller)["layers"]
+        Z = table(spec(ds, "states", f"test.{smaller}.L{last}.fbin"))
         for fit_set, Y in targets.items():
-            X = table(spec(ds, "states", f"{fit_set}.minilm.L{last}.fbin"))
+            X = table(spec(ds, "states", f"{fit_set}.{smaller}.L{last}.fbin"))
             split = dict(made, split_seed=SPLIT_SEED[fit_set])
-            predict(spec(ds, "ehat", f"minilm.{fit_set}"), split, X, Y, Z, e, subsets)
+            predict(spec(ds, "ehat", f"{smaller}.{fit_set}"), split, X, Y, Z, e, subsets)
 
     n = SMALL_FIT[ds]
     small_file = spec(ds, "ehat", f"openings{n}.json")
@@ -246,7 +262,7 @@ def ridge(ds):
 
     if not c.up_to_date([], small_file, **small_made):
         small = {}
-        for layer in LAYERS[ds]:
+        for layer in fire:
             X = table(spec(ds, "states", f"openings.L{layer}.fbin"))[:n]
             Z = table(spec(ds, "states", f"test.L{layer}.fbin"))
             _, info = fit(X, targets["openings"][:n], Z, e, subsets, SPLIT_SEED["openings"])
@@ -283,9 +299,10 @@ def probe_ceilings(ds, stem):
     return out
 
 
-def clusters(ds):
+def clusters(ds, name=None):
     """Clusters the corpus with plain and spherical k-means, then groups the clusters, and writes both. Then it writes
-    the probe ceilings of both, again whenever they were made for other evaluation queries."""
+    the probe ceilings of both, again whenever they were made for other evaluation queries. The corpus is the one of
+    the data folder, so `name` only says whose it is."""
     base = c.open_table(c.path(f"{ds}_corpus.fbin"))
     n, d = base.shape
     nlist = n // VECTORS_PER_LIST
@@ -340,7 +357,7 @@ def clusters(ds):
         print(ds, kind, "probe ceilings", recall, flush=True)
 
 
-def timing(ds):
+def timing(ds, name=None):
     """Times the model to each layer at batch 1 on the processor, the way a query arrives, after a warm-up."""
     out = spec(ds, "timing.json")
 
@@ -350,17 +367,18 @@ def timing(ds):
     import torch
 
     torch.set_num_threads(TIMING_THREADS)
-    name = c.DATASETS[ds]
+    name = own(ds, name)
     st = c.load_model(name, "cpu")
-    net, tok, prompt = st[0].auto_model, st.tokenizer, c.prompt_of(st, name)
+    net, tok, prompt = st[0].auto_model, st.tokenizer, c.model(name)["query_prompt"]
     texts = [r["text"] for r in c.read_jsonl(c.path(f"{ds}_test.jsonl"))][:TIMING_WARMUP + TIMING_RUNS]
     marks = []
 
     def stamp(module, args, output):
         marks.append(time.perf_counter())
 
-    hooks = [net.embeddings.register_forward_hook(stamp)]
-    hooks += [layer.register_forward_hook(stamp) for layer in net.encoder.layer]
+    embedding, layers = c.layer_modules(net)
+    hooks = [embedding.register_forward_hook(stamp)]
+    hooks += [layer.register_forward_hook(stamp) for layer in layers]
     per, total = [], []
     load_before = os.getloadavg()
 
@@ -390,30 +408,32 @@ def read(file):
     return c.read_json(file) if os.path.exists(file) else None
 
 
-def summary(ds):
+def summary(ds, name=None):
     """Collects the numbers of every step that has run into summary.json, and returns it."""
+    m = c.model(own(ds, name))
     folder = spec(ds, "states")
     names = sorted(f for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
     sets = {f[:-len(".json")]: read(os.path.join(folder, f)) for f in names}
     preds, cos, lams = {}, {}, {}
 
     for fit_set in ("openings", "queries"):
-        for layer in LAYERS[ds]:
+        for layer in m["fire"]:
             info = read(spec(ds, "ehat", f"{fit_set}.L{layer}.json"))
             if info:
                 preds[f"{fit_set}.L{layer}"] = info
                 cos.setdefault(fit_set, {})[str(layer)] = round(info["cos"], 4)
                 lams.setdefault(fit_set, {})[str(layer)] = info["lam"]
 
-    for fit_set in ("openings", "queries"):
-        info = read(spec(ds, "ehat", f"minilm.{fit_set}.json"))
-        if info:
-            preds[f"minilm.{fit_set}"] = info
-            cos.setdefault("minilm", {})[fit_set] = round(info["cos"], 4)
+    if (ds, m["name"]) in SMALLER:
+        smaller = SMALLER[ds, m["name"]]
+        for fit_set in ("openings", "queries"):
+            info = read(spec(ds, "ehat", f"{smaller}.{fit_set}.json"))
+            if info:
+                preds[f"{smaller}.{fit_set}"] = info
+                cos.setdefault(smaller, {})[fit_set] = round(info["cos"], 4)
 
-    out = dict(dataset=ds, model=c.MODELS[c.DATASETS[ds]]["repo"], layers=LAYERS[ds],
-               final_layer=c.MODELS[c.DATASETS[ds]]["layers"], openings_seed=OPENING_SEED, max_len=MAX_LEN,
-               lambdas=LAMBDAS, split_seed=SPLIT_SEED, cos=cos, lam=lams,
+    out = dict(dataset=ds, model=m["repo"], layers=m["fire"], final_layer=m["layers"], openings_seed=OPENING_SEED,
+               max_len=MAX_LEN, lambdas=LAMBDAS, split_seed=SPLIT_SEED, cos=cos, lam=lams,
                training_sets={s: read(spec(ds, f"{s}.meta.json")) for s in ("openings", "queries")},
                sets=sets, e=read(spec(ds, "e.json")), predictors=preds,
                small_fit=read(spec(ds, "ehat", f"openings{SMALL_FIT[ds]}.json")),
@@ -443,6 +463,7 @@ CHILD = "SPEC_STATES_STEP"
 
 def main():
     ap = argparse.ArgumentParser(description="Layer states, ridge predictors and clusters for SpecWave.")
+    ap.add_argument("--model", help="a short name of the models list, the dataset's own model by default")
     ap.add_argument("dataset", choices=sorted(c.DATASETS))
     ap.add_argument("steps", nargs="*", help=f"any of {', '.join(STEPS)}, all of them by default, run in this order")
     a = ap.parse_args()
@@ -450,18 +471,24 @@ def main():
     if any(s not in STEPS for s in a.steps):
         ap.error(f"steps are {', '.join(STEPS)}")
 
+    try:
+        name = c.use_model(a.model or c.DATASETS[a.dataset], a.dataset)
+    except KeyError as e:
+        ap.error(str(e))
+
     if os.environ.get(CHILD):
         for step in a.steps:
-            STEP[step](a.dataset)
+            STEP[step](a.dataset, name)
         return
 
     before = outputs(a.dataset)
     env = dict(os.environ, **{CHILD: "1"})
 
     for step in [s for s in STEPS if s in a.steps] or STEPS:
-        subprocess.run([sys.executable, os.path.abspath(__file__), a.dataset, step], check=True, env=env)
+        subprocess.run([sys.executable, os.path.abspath(__file__), "--model", name, a.dataset, step], check=True,
+                       env=env)
 
-    s = summary(a.dataset)
+    s = summary(a.dataset, name)
 
     if outputs(a.dataset) != before:
         compact = dict(dataset=s["dataset"], model=s["model"], cos=s["cos"], lam=s["lam"],

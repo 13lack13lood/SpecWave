@@ -17,25 +17,47 @@ import time
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DATA = os.path.join(REPO, "data")
-RESULTS = os.path.join(REPO, "results")
+# The folders of the dataset's own model. $SPECWAVE_DATA and $SPECWAVE_RESULTS name others, and `use_model` points
+# both at the folders of another model.
+SHARED_DATA = os.path.join(REPO, "data")
+SHARED_RESULTS = os.path.join(REPO, "results")
+DATA = os.environ.get("SPECWAVE_DATA") or SHARED_DATA
+RESULTS = os.environ.get("SPECWAVE_RESULTS") or SHARED_RESULTS
 # The Hugging Face (HF) cache, where the models and the BeIR (Benchmarking Information Retrieval) parquet files are.
 HUB = os.environ.get("HF_HUB_CACHE", os.path.join(os.environ.get("HF_HOME", "~/.cache/huggingface"), "hub"))
 HUB = os.path.expanduser(HUB)
 
-# The embedding model of each dataset. FiQA (financial opinion mining and question answering) uses arctic, which
-# pools the CLS (classification) token and prefixes queries with a prompt. Quora uses MiniLM, which pools the mean of
-# the tokens and has no prompt.
-MODELS = {
-    "arctic": dict(repo="Snowflake/snowflake-arctic-embed-m-v1.5", layers=12, dim=768, cls=True, prompt="query"),
-    "minilm": dict(repo="sentence-transformers/all-MiniLM-L6-v2", layers=6, dim=384, cls=False, prompt=None),
-}
+# The model whose embeddings each dataset's files in data/ hold. FiQA (financial opinion mining and question
+# answering) has arctic's and Quora MiniLM's. Any other model of the models list gets folders of its own.
 DATASETS = {"fiqa": "arctic", "quora": "minilm"}
 # The models list that the Rust encoder reads too, with each model's short name, its layers that may fire and the
 # prompts its sentence-transformers settings leave out.
 MODEL_LIST = os.path.join(REPO, "specwave", "src", "encoder", "models.json")
 # The names a passage prompt goes by in sentence-transformers' settings, in the order it tries them.
 PASSAGE_NAMES = ("document", "passage", "corpus")
+# The model types whose attention is causal, so only their last token sees the whole text. A layer's summary takes
+# that token, the end-of-text token their tokenizer appends, where the others take the first.
+CAUSAL = ("qwen3",)
+
+
+def use_model(name, dataset):
+    """Points DATA and RESULTS at the folders of the listed model `name` on `dataset`, unless $SPECWAVE_DATA and
+    $SPECWAVE_RESULTS name others. The dataset's own model uses data/ and results/, and any other model
+    data/models/<name>/ and results/models/<name>/. Another model in the folders of the dataset's own model raises
+    ValueError, since its outputs would mix with those files. Returns the short name."""
+    global DATA, RESULTS
+    name = listed(name)["name"]
+    own = DATASETS[dataset] == name
+    DATA = os.environ.get("SPECWAVE_DATA") or (SHARED_DATA if own else os.path.join(SHARED_DATA, "models", name))
+    RESULTS = os.environ.get("SPECWAVE_RESULTS") or (
+        SHARED_RESULTS if own else os.path.join(SHARED_RESULTS, "models", name))
+    shared = [f for f, base in ((DATA, SHARED_DATA), (RESULTS, SHARED_RESULTS))
+              if os.path.realpath(f) == os.path.realpath(base)]
+
+    if shared and not own:
+        raise ValueError(f"{name} can't write to {shared[0]}, which holds {DATASETS[dataset]}'s files")
+
+    return name
 
 
 def path(*parts):
@@ -359,6 +381,17 @@ def prompts(entry):
     return pick(("query",), "query_prompt"), pick(PASSAGE_NAMES, "passage_prompt")
 
 
+def model(name):
+    """What the data scripts need of the listed model `name`, from the list and the files of its snapshot: its short
+    name, repository, layer count, width, the layers that may fire (`fire`), its query and passage prompts, and its
+    model type, eg. "bert"."""
+    entry = listed(name)
+    config = read_json(os.path.join(snapshot(entry["repo"]), "config.json"))
+    query, passage = prompts(entry)
+    return dict(name=entry["name"], repo=entry["repo"], layers=config["num_hidden_layers"], dim=config["hidden_size"],
+                fire=entry["layers"], query_prompt=query, passage_prompt=passage, model_type=config["model_type"])
+
+
 def device():
     import torch
 
@@ -366,33 +399,68 @@ def device():
 
 
 def load_model(name, dev):
-    """The sentence-transformers model `name` ("arctic" or "minilm") from the local cache, on device `dev`."""
+    """The sentence-transformers model of the listed model `name`, eg. "arctic", from the local cache, in float32 on
+    device `dev`. It runs transformers' own code of every model, also of nomic-bert, whose snapshot points at code of
+    its own that transformers 5 can't run. A causal model keeps no cache of its attention keys and values, which only
+    text generation reads."""
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    import torch
     from sentence_transformers import SentenceTransformer
 
-    st = SentenceTransformer(MODELS[name]["repo"], device=dev)
+    m = model(name)
+    st = SentenceTransformer(m["repo"], device=dev, trust_remote_code=False, model_kwargs={"dtype": torch.float32})
     st.eval()
+    dtype = next(st.parameters()).dtype
+
+    if dtype != torch.float32:
+        raise ValueError(f"{name} loaded in {dtype}, not float32")
+
+    if m["model_type"] in CAUSAL:
+        st[0].auto_model.config.use_cache = False
+
     return st
 
 
-def prompt_of(st, name):
-    """The text a query starts with for model `name`, eg. arctic's "Represent this sentence for searching ..."."""
-    which = MODELS[name]["prompt"]
-    return st.prompts.get(which, "") if which else ""
+def pooling_of(st):
+    """How the sentence-transformers model `st` pools its last layer, eg. "cls", "mean" or "lasttoken"."""
+    return st[1].pooling_mode
 
 
-def encode_states(st, texts, prompt, layers, states, final=None, cls=True, batch=64, max_len=128):
-    """Runs the model on `prompt + text` for every text and writes the pooled state of each layer in `layers` into
+def hidden_states(net, enc):
+    """Every hidden state of the transformers model `net` on the batch `enc`, the embedding output first, so entry l is
+    the state after l layers. A causal model's last entry comes after its final norm, as its embedding does."""
+    return net(**enc, output_hidden_states=True).hidden_states
+
+
+def layer_modules(net):
+    """The module that ends the embedding step of the transformers model `net`, and its transformer layers in order,
+    for BERT, nomic-bert and Qwen3."""
+    if hasattr(net, "encoder"):
+        return net.embeddings, list(net.encoder.layer)
+
+    if hasattr(net, "embeddings"):
+        return net.embeddings, list(net.layers)
+
+    return net.embed_tokens, list(net.layers)
+
+
+def encode_states(st, texts, prompt, layers, states, final=None, pooling="cls", batch=64, max_len=128):
+    """Runs the model on `prompt + text` for every text and writes the summary of each layer in `layers` into
     `states[layer]` (n × 2d) and the normalized final embedding into `final` (n × d), in input order.
 
-    Layer l is the hidden state after l transformer layers, and l = 0 is the embedding output. A pooled state is the
-    mean over the attention mask, then the CLS vector. The final embedding pools the last layer like the model does,
-    with the CLS vector (`cls`) or the masked mean. Batches hold texts of similar token counts, so little of each is
-    padding. Returns each text's token count."""
+    Layer l is the hidden state after l transformer layers, and l = 0 is the embedding output. A layer's summary is the
+    mean over the attention mask, then the vector of one token. That is the first (CLS) token, or the last token for a
+    causal model. The final embedding pools the last layer like the model does, with the first token (`pooling`
+    "cls"), the last token ("lasttoken") or the masked mean ("mean"). Batches hold texts of similar token counts, so
+    little of each is padding. Returns each text's token count."""
     import torch
+
+    if pooling not in ("cls", "mean", "lasttoken"):
+        raise ValueError(f"no pooling {pooling!r}, only cls, mean and lasttoken")
 
     tok, net = st.tokenizer, st[0].auto_model
     dev = next(net.parameters()).device
+    causal = net.config.model_type in CAUSAL
     full = [prompt + t for t in texts]
     lengths = [len(ids) for ids in tok(full, truncation=True, max_length=max_len)["input_ids"]]
     order = np.argsort(lengths, kind="stable")[::-1]
@@ -401,16 +469,26 @@ def encode_states(st, texts, prompt, layers, states, final=None, cls=True, batch
         for b, s in enumerate(range(0, len(order), batch)):
             idx = order[s:s + batch]
             enc = tok([full[i] for i in idx], padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+            # The last token of each text, on whichever side the tokenizer pads.
+            width = enc["attention_mask"].shape[1]
+            ends = (width - 1 - enc["attention_mask"].flip(1).argmax(1)).to(dev)
+            rows = torch.arange(len(idx), device=dev)
             enc = enc.to(dev)
-            hs = net(**enc, output_hidden_states=True).hidden_states
+            hs = hidden_states(net, enc)
             mask = enc["attention_mask"].unsqueeze(-1).to(hs[0].dtype)
             for layer in layers:
                 h = hs[layer]
                 mean = (h * mask).sum(1) / mask.sum(1)
-                states[layer][idx] = torch.cat([mean, h[:, 0]], 1).float().cpu().numpy()
+                token = h[rows, ends] if causal else h[:, 0]
+                states[layer][idx] = torch.cat([mean, token], 1).float().cpu().numpy()
             if final is not None:
                 h = hs[-1]
-                e = h[:, 0] if cls else (h * mask).sum(1) / mask.sum(1)
+                if pooling == "cls":
+                    e = h[:, 0]
+                elif pooling == "lasttoken":
+                    e = h[rows, ends]
+                else:
+                    e = (h * mask).sum(1) / mask.sum(1)
                 final[idx] = torch.nn.functional.normalize(e, dim=-1).float().cpu().numpy()
             if dev.type == "mps" and b % 20 == 0:
                 torch.mps.empty_cache()
