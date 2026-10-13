@@ -28,7 +28,7 @@ crc32fast = "1.5.2"
 faer = { version = "0.24.4", default-features = false, features = ["std", "rayon"] }
 # serde_json: the cached fit of each disk volume's read speed, and with `candle` the model's settings files.
 serde_json = "1.0.145"
-# candle-core, candle-nn: the tensors and layers of the BERT encoder.
+# candle-core, candle-nn: the tensors and layers of the encoder's networks, BERT, NomicBERT and Qwen3.
 candle-core = { version = "0.11.0", optional = true }
 candle-nn = { version = "0.11.0", optional = true }
 # tokenizers: reads the model's tokenizer.json. It is the copy candle-core already pulls in.

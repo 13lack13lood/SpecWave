@@ -17,7 +17,9 @@ fn the_list_parses_and_names_each_model_and_repository_once() {
             "bge-base",
             "e5-base",
             "bge-large",
-            "mxbai-large"
+            "mxbai-large",
+            "nomic",
+            "qwen3-0.6b"
         ]
     );
 
@@ -56,8 +58,25 @@ fn listed_prompts_come_with_the_file_that_gives_them() {
         assert_eq!(bge.passage_prompt.as_deref(), Some(""));
     }
 
-    // mxbai-embed-large-v1's own settings hold its prompts.
+    // mxbai-embed-large-v1's own settings hold its prompts, as Qwen3-Embedding-0.6B's do.
     assert_eq!(find("mxbai-large").unwrap().unwrap().prompts_from, None);
+    assert_eq!(find("qwen3-0.6b").unwrap().unwrap().prompts_from, None);
+
+    let nomic = find("nomic-ai/nomic-embed-text-v1.5").unwrap().unwrap();
+    assert_eq!(
+        (nomic.query_prompt.as_deref(), nomic.passage_prompt.as_deref()),
+        (Some("search_query: "), Some("search_document: "))
+    );
+    assert_eq!(nomic.prompts_from.as_deref(), Some("README.md"));
+}
+
+#[test]
+fn nomic_and_qwen3_keep_their_layers_that_may_fire() {
+    assert_eq!(find("nomic").unwrap().unwrap().layers, [0, 3, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(
+        find("Qwen/Qwen3-Embedding-0.6B").unwrap().unwrap().layers,
+        [0, 7, 14, 19, 21, 23, 24, 25, 26, 27]
+    );
 }
 
 #[test]

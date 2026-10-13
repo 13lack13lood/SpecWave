@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::encoder::testutil::{
-    Kind, TempSnapshot, VOCAB, assert_close, tiny_config, tiny_snapshot, tiny_weights, values,
+    Kind, Net, TempSnapshot, VOCAB, assert_close, tiny_config, tiny_net_snapshot, tiny_snapshot, tiny_weights, values,
 };
 
 const PROMPT: &str = "search for: ";
@@ -54,7 +54,7 @@ fn states(encoder: &CandleEncoder, ids: &[u32]) -> Vec<Vec<f32>> {
     let mut states = Vec::new();
     encoder
         .model
-        .forward_layers(&input_ids, &token_type_ids, None, encoder.layers, &mut |_, state| {
+        .forward_layers(&input_ids, &token_type_ids, encoder.layers, &mut |_, state| {
             states.push(values(state));
             Ok(())
         })
@@ -74,6 +74,13 @@ fn host_summary(state: &[f32], tokens: usize, dim: usize) -> Vec<f32> {
 
     let mut out: Vec<f32> = mean.iter().map(|m| (m / tokens as f64) as f32).collect();
     out.extend_from_slice(&state[..dim]);
+    out
+}
+
+/// concat(average over the tokens, last token) of a state of `tokens` × `dim` values, computed on the host.
+fn host_summary_last(state: &[f32], tokens: usize, dim: usize) -> Vec<f32> {
+    let mut out = host_summary(state, tokens, dim);
+    out[dim..].copy_from_slice(&state[(tokens - 1) * dim..]);
     out
 }
 
@@ -254,6 +261,210 @@ fn run_to_reaches_every_layer_and_no_further() {
     assert_eq!(encoder.run_to(TEXT, 3).unwrap_err().kind(), ErrorKind::InvalidInput);
 }
 
+/// The ids of the prompt and `TEXT` for a tiny Qwen3 snapshot, whose tokenizer ends the text with [SEP] alone.
+const QWEN3_IDS: [u32; 7] = [4, 5, 6, 7, 8, 9, 3];
+
+#[test]
+fn the_model_type_picks_the_network() {
+    for (net, name) in [(Net::Bert, "bert"), (Net::NomicBert, "nomic"), (Net::Qwen3, "qwen3")] {
+        let pooling = if net == Net::Qwen3 { "lasttoken" } else { "mean" };
+        let snapshot = tiny_net_snapshot(&format!("network-{name}"), net, 2, pooling, Some(PROMPT));
+        let mut encoder = open(&snapshot);
+        let embedding = encoder.encode(TEXT, &mut NoHook).unwrap();
+        let network = match &encoder.model {
+            Network::Bert(_) => Net::Bert,
+            Network::NomicBert(_) => Net::NomicBert,
+            Network::Qwen3(_) => Net::Qwen3,
+        };
+        assert_eq!(network, net, "{name}");
+        assert_eq!(
+            (encoder.layers(), encoder.dim(), embedding.len()),
+            (2, 16, 16),
+            "{name}"
+        );
+        assert_eq!(encoder.model.causal(), net == Net::Qwen3, "{name}");
+    }
+
+    // A config without a model type is BERT, and one this encoder has no network for gives Unsupported.
+    let untyped = tiny_snapshot("network-untyped", &CLS_WITH_PROMPT);
+    let path = untyped.0.join("config.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("model_type");
+    std::fs::write(&path, json.to_string()).unwrap();
+    assert!(matches!(open(&untyped).model, Network::Bert(_)));
+
+    let other = tiny_snapshot("network-other", &CLS_WITH_PROMPT);
+    set_field(&other, "config.json", "model_type", "roberta".into());
+    let found = CandleEncoder::open(&other.0, Backend::Cpu).err().map(|e| e.kind());
+    assert_eq!(found, Some(ErrorKind::Unsupported));
+}
+
+#[test]
+fn a_causal_network_summarizes_each_layer_with_its_last_token_and_pools_the_last_one() {
+    let snapshot = tiny_net_snapshot("qwen3-hook", Net::Qwen3, 2, "lasttoken", Some(PROMPT));
+    let mut encoder = open(&snapshot);
+    let mut hook = Recorder::new(&[0, 1, 2]);
+    let embedding = encoder.encode(TEXT, &mut hook).unwrap();
+
+    assert_eq!(encoder.tokenize(PROMPT, TEXT).unwrap().get_ids(), QWEN3_IDS);
+    let whole = states(&encoder, &QWEN3_IDS);
+    assert_eq!(hook.seen.iter().map(|(layer, _)| *layer).collect::<Vec<_>>(), [0, 1, 2]);
+
+    for (layer, pooled) in &hook.seen {
+        let expected = host_summary_last(&whole[*layer], QWEN3_IDS.len(), 16);
+        assert_close(pooled, &expected, 1e-6, &format!("layer {layer}"));
+    }
+
+    assert_close(&embedding, &normalized(&whole[2][6 * 16..]), 1e-6, "the embedding");
+    assert_eq!(encoder.pooling(), Pooling::LastToken);
+    assert_eq!(encoder.tokens(TEXT).unwrap(), 7);
+
+    // The cut text keeps its last token, so the pooled token stays the text's end.
+    encoder.set_max_tokens(4).unwrap();
+    let cut = [4, 5, 6, 3];
+    assert_eq!(encoder.tokenize(PROMPT, TEXT).unwrap().get_ids(), cut);
+    let embedding = encoder.encode(TEXT, &mut NoHook).unwrap();
+    assert_close(
+        &embedding,
+        &normalized(&states(&encoder, &cut)[2][3 * 16..]),
+        1e-6,
+        "the cut text",
+    );
+    assert_eq!(encoder.set_max_tokens(1).unwrap_err().kind(), ErrorKind::InvalidInput);
+
+    for layer in 0..=2 {
+        encoder.run_to(TEXT, layer).unwrap();
+    }
+
+    assert_eq!(encoder.run_to(TEXT, 3).unwrap_err().kind(), ErrorKind::InvalidInput);
+}
+
+#[test]
+fn nomic_bert_summarizes_each_layer_with_its_first_token_and_averages_the_last_one() {
+    let snapshot = tiny_net_snapshot("nomic-hook", Net::NomicBert, 2, "mean", Some(PROMPT));
+    let mut encoder = open(&snapshot);
+    let mut hook = Recorder::new(&[0, 2]);
+    let embedding = encoder.encode(TEXT, &mut hook).unwrap();
+    let states = states(&encoder, &IDS);
+
+    for (layer, pooled) in &hook.seen {
+        assert_close(
+            pooled,
+            &host_summary(&states[*layer], IDS.len(), 16),
+            1e-6,
+            &format!("layer {layer}"),
+        );
+    }
+
+    let mean = &host_summary(&states[2], IDS.len(), 16)[..16];
+    assert_close(&embedding, &normalized(mean), 1e-6, "the embedding");
+    assert_eq!(hook.seen.iter().map(|(layer, _)| *layer).collect::<Vec<_>>(), [0, 2]);
+    assert_eq!(encoder.pooling(), Pooling::Mean);
+    // Its rotary tables hold 32 positions, though its config gives max_position_embeddings 16.
+    encoder.set_max_tokens(100).unwrap();
+    assert_eq!(encoder.max_tokens(), 32);
+}
+
+#[test]
+fn last_token_pooling_works_for_bert_too_and_mixed_poolings_are_refused() {
+    let snapshot = tiny_net_snapshot("bert-last", Net::Bert, 2, "lasttoken", Some(PROMPT));
+    let mut encoder = open(&snapshot);
+    let embedding = encoder.encode(TEXT, &mut NoHook).unwrap();
+    let mut hook = Recorder::new(&[1]);
+    encoder.encode(TEXT, &mut hook).unwrap();
+    let states = states(&encoder, &IDS);
+
+    assert_close(&embedding, &normalized(&states[2][7 * 16..]), 1e-6, "the embedding");
+    // BERT isn't causal, so its summaries keep the first token.
+    assert_close(
+        &hook.seen[0].1,
+        &host_summary(&states[1], IDS.len(), 16),
+        1e-6,
+        "layer 1",
+    );
+
+    let mixed = tiny_net_snapshot("mixed-last", Net::Qwen3, 2, "lasttoken", None);
+    set_field(&mixed, "1_Pooling/config.json", "pooling_mode_mean_tokens", true.into());
+    let found = CandleEncoder::open(&mixed.0, Backend::Cpu).err().map(|e| e.kind());
+    assert_eq!(found, Some(ErrorKind::Unsupported));
+}
+
+#[test]
+fn nomic_bert_and_qwen3_settings_that_dont_fit_give_errors() {
+    let cases: [(&str, Net, &str, serde_json::Value, ErrorKind); 9] = [
+        (
+            "nomic-no-layers",
+            Net::NomicBert,
+            "n_layer",
+            0.into(),
+            ErrorKind::InvalidData,
+        ),
+        (
+            "nomic-uneven-heads",
+            Net::NomicBert,
+            "n_head",
+            3.into(),
+            ErrorKind::InvalidData,
+        ),
+        (
+            "nomic-odd-heads",
+            Net::NomicBert,
+            "n_head",
+            16.into(),
+            ErrorKind::InvalidData,
+        ),
+        (
+            "nomic-gelu",
+            Net::NomicBert,
+            "activation_function",
+            "gelu".into(),
+            ErrorKind::Unsupported,
+        ),
+        (
+            "nomic-partial",
+            Net::NomicBert,
+            "rotary_emb_fraction",
+            0.5.into(),
+            ErrorKind::Unsupported,
+        ),
+        (
+            "qwen3-uneven-groups",
+            Net::Qwen3,
+            "num_key_value_heads",
+            3.into(),
+            ErrorKind::InvalidData,
+        ),
+        (
+            "qwen3-odd-heads",
+            Net::Qwen3,
+            "head_dim",
+            7.into(),
+            ErrorKind::InvalidData,
+        ),
+        (
+            "qwen3-window",
+            Net::Qwen3,
+            "use_sliding_window",
+            true.into(),
+            ErrorKind::Unsupported,
+        ),
+        (
+            "qwen3-scaled",
+            Net::Qwen3,
+            "rope_scaling",
+            serde_json::json!({"rope_type": "yarn", "factor": 4.0}),
+            ErrorKind::Unsupported,
+        ),
+    ];
+
+    for (name, net, field, value, expected) in cases {
+        let snapshot = tiny_net_snapshot(name, net, 2, "mean", None);
+        set_field(&snapshot, "config.json", field, value);
+        let found = CandleEncoder::open(&snapshot.0, Backend::Cpu).err().map(|e| e.kind());
+        assert_eq!(found, Some(expected), "{name}");
+    }
+}
+
 #[test]
 fn damaged_or_unsupported_snapshots_give_errors() {
     let cases: [(&str, &str, Option<&str>, ErrorKind); 6] = [
@@ -426,7 +637,7 @@ fn settings_that_dont_fit_the_model_give_errors_and_fitting_ones_open() {
 
     // A vocabulary one word short of the tokenizer's, with weights of that size, so only the vocabulary check fails.
     let snapshot = tiny_snapshot("small-vocabulary", &CLS_WITH_PROMPT);
-    let config = Config {
+    let config = bert::Config {
         vocab_size: VOCAB.len() - 1,
         ..tiny_config(2)
     };
@@ -1116,4 +1327,16 @@ fn arctic_matches_sentence_transformers_and_transformers() {
 #[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
 fn minilm_matches_sentence_transformers_and_transformers() {
     check_references("minilm");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn nomic_matches_sentence_transformers_and_transformers() {
+    check_references("nomic");
+}
+
+#[test]
+#[ignore = "reads the real models and encoder_refs.py's references, run by hand"]
+fn qwen3_matches_sentence_transformers_and_transformers() {
+    check_references("qwen3-0.6b");
 }

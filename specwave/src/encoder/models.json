@@ -45,5 +45,18 @@
     "name": "mxbai-large",
     "repo": "mixedbread-ai/mxbai-embed-large-v1",
     "layers": [0, 6, 12, 16, 18, 19, 20, 21, 22, 23]
+  },
+  {
+    "name": "nomic",
+    "repo": "nomic-ai/nomic-embed-text-v1.5",
+    "query_prompt": "search_query: ",
+    "passage_prompt": "search_document: ",
+    "prompts_from": "README.md",
+    "layers": [0, 3, 6, 7, 8, 9, 10, 11]
+  },
+  {
+    "name": "qwen3-0.6b",
+    "repo": "Qwen/Qwen3-Embedding-0.6B",
+    "layers": [0, 7, 14, 19, 21, 23, 24, 25, 26, 27]
   }
 ]

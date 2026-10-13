@@ -2,10 +2,13 @@
 //!
 //! A snapshot holds `config.json`, `model.safetensors` and `tokenizer.json`, plus the sentence-transformers settings
 //! in `modules.json`, `sentence_bert_config.json`, `config_sentence_transformers.json` and the pooling folder that
-//! `modules.json` names, eg. `1_Pooling/config.json`. The sizes come from `config.json`, and the rest from those
-//! settings, as sentence-transformers reads them.
-//! - **Pooling.** The state of the classification (CLS) token, eg. for arctic-embed-m, or the average over the
-//!   tokens, eg. for all-MiniLM-L6-v2 and e5-base-v2.
+//! `modules.json` names, eg. `1_Pooling/config.json`. The network and its sizes come from `config.json`, and the rest
+//! from those settings, as sentence-transformers reads them.
+//! - **Network.** The `model_type` of `config.json` picks it: BERT (Bidirectional Encoder Representations from
+//!   Transformers) for `bert`, eg. arctic-embed-m, NomicBERT for `nomic_bert`, i.e. nomic-embed-text-v1.5, and Qwen3
+//!   for `qwen3`, eg. Qwen3-Embedding-0.6B. A config without one is BERT.
+//! - **Pooling.** The state of the classification (CLS) token, eg. for arctic-embed-m, the average over the tokens,
+//!   eg. for all-MiniLM-L6-v2 and e5-base-v2, or the state of the last token, eg. for Qwen3-Embedding-0.6B.
 //! - **Prompts.** The text in front of each query and of each passage, i.e. each document of the corpus, eg. "query: "
 //!   and "passage: " for e5-base-v2. A model whose settings don't hold its prompts, eg. bge-small-en-v1.5, gets them
 //!   from the [`models`](super::models) list, which names the file of the snapshot that gives them.
@@ -15,8 +18,9 @@
 //!   model with no normalizing module whose settings name a similarity other than cosine.
 //!
 //! The encoder takes one text at a time, so there is no padding and the average over the tokens is the masked
-//! average. Each layer's summary, concat(average, first token), is computed on the device, and only the summaries the
-//! hook wants are copied back.
+//! average. Each layer's summary, concat(average, pooling token), is computed on the device, and only the summaries the
+//! hook wants are copied back. The pooling token is the first token, or the last one for a causal network such as
+//! Qwen3, where only the last token sees the whole text.
 
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
@@ -29,8 +33,10 @@ use serde::de::DeserializeOwned;
 use tokenizers::normalizers::{Lowercase, Sequence};
 use tokenizers::{NormalizerWrapper, PostProcessor, Tokenizer, TruncationParams};
 
-use super::bert::{BertModel, Config};
+use super::bert::{self, BertModel};
 use super::models::{self, Model};
+use super::nomic_bert::{self, NomicBertModel};
+use super::qwen3;
 use super::{LayerEncoder, LayerHook, NoHook};
 
 /// Where the model runs.
@@ -50,11 +56,142 @@ pub enum Pooling {
     Cls,
     /// The average over the tokens.
     Mean,
+    /// The last token's state, eg. the end-of-text token that Qwen3-Embedding's tokenizer appends.
+    LastToken,
 }
 
-/// A sentence-transformers BERT model on candle, with its tokenizer, prompts and pooling.
+/// A network of the encoder, with its weights.
+enum Network {
+    Bert(BertModel),
+    NomicBert(NomicBertModel),
+    Qwen3(qwen3::Model),
+}
+
+impl Network {
+    /// Runs the embeddings and the first `layers` layers on `input_ids`, and shows each state to `observe` as the
+    /// network's `forward_layers` does. `token_type_ids` go to the networks that read them.
+    fn forward_layers(
+        &self,
+        input_ids: &Tensor,
+        token_type_ids: &Tensor,
+        layers: usize,
+        observe: &mut dyn FnMut(usize, &Tensor) -> candle_core::Result<()>,
+    ) -> candle_core::Result<Tensor> {
+        match self {
+            Network::Bert(model) => model.forward_layers(input_ids, token_type_ids, None, layers, observe),
+            Network::NomicBert(model) => model.forward_layers(input_ids, token_type_ids, None, layers, observe),
+            Network::Qwen3(model) => model.forward_layers(input_ids, layers, observe),
+        }
+    }
+
+    /// Whether each token sees only itself and the tokens before it, so only the last token sees the whole text.
+    fn causal(&self) -> bool {
+        matches!(self, Network::Qwen3(_))
+    }
+}
+
+/// The settings in a snapshot's `config.json`, for the network its `model_type` names.
+enum NetworkConfig {
+    Bert(bert::Config),
+    NomicBert(nomic_bert::Config),
+    Qwen3(qwen3::Config),
+}
+
+#[derive(Deserialize)]
+struct ModelType {
+    model_type: Option<String>,
+}
+
+/// The sizes of a network that the encoder reads.
+struct Shape {
+    layers: usize,
+    dim: usize,
+    /// The positions, the most tokens the network can read.
+    positions: usize,
+    vocab: usize,
+}
+
+impl NetworkConfig {
+    /// Reads `config.json` at `path`. A model type this encoder has no network for gives `Unsupported`.
+    fn read(path: &Path) -> Result<NetworkConfig, Error> {
+        let kind: ModelType = read_json(path)?;
+
+        match kind.model_type.as_deref() {
+            None | Some("bert") => Ok(NetworkConfig::Bert(read_json(path)?)),
+            Some("nomic_bert") => Ok(NetworkConfig::NomicBert(read_json(path)?)),
+            Some("qwen3") => Ok(NetworkConfig::Qwen3(read_json(path)?)),
+            Some(other) => Err(unsupported(&format!("a model of type {other}"))),
+        }
+    }
+
+    /// The network's sizes. A shape that no network of its kind has gives `InvalidData`, and a setting the network
+    /// can't run gives `Unsupported`.
+    fn shape(&self) -> Result<Shape, Error> {
+        match self {
+            NetworkConfig::Bert(c) => {
+                if c.num_hidden_layers == 0
+                    || c.num_attention_heads == 0
+                    || !c.hidden_size.is_multiple_of(c.num_attention_heads)
+                {
+                    return Err(damaged("config.json has a shape no BERT model has"));
+                }
+                Ok(Shape {
+                    layers: c.num_hidden_layers,
+                    dim: c.hidden_size,
+                    positions: c.max_position_embeddings,
+                    vocab: c.vocab_size,
+                })
+            }
+            NetworkConfig::NomicBert(c) => {
+                // Each head turns its values in pairs for the rotary embedding, so its size must be even.
+                if c.n_layer == 0 || c.n_head == 0 || !c.n_embd.is_multiple_of(2 * c.n_head) {
+                    return Err(damaged("config.json has a shape no NomicBERT model has"));
+                }
+                if let Some(what) = c.unsupported() {
+                    return Err(unsupported(what));
+                }
+                Ok(Shape {
+                    layers: c.n_layer,
+                    dim: c.n_embd,
+                    positions: c.n_positions,
+                    vocab: c.vocab_size,
+                })
+            }
+            NetworkConfig::Qwen3(c) => {
+                if c.num_hidden_layers == 0
+                    || c.num_key_value_heads == 0
+                    || c.num_attention_heads == 0
+                    || !c.num_attention_heads.is_multiple_of(c.num_key_value_heads)
+                    || c.head_dim == 0
+                    || !c.head_dim.is_multiple_of(2)
+                {
+                    return Err(damaged("config.json has a shape no Qwen3 model has"));
+                }
+                if let Some(what) = c.unsupported() {
+                    return Err(unsupported(what));
+                }
+                Ok(Shape {
+                    layers: c.num_hidden_layers,
+                    dim: c.hidden_size,
+                    positions: c.max_position_embeddings,
+                    vocab: c.vocab_size,
+                })
+            }
+        }
+    }
+
+    fn load(&self, vb: VarBuilder) -> candle_core::Result<Network> {
+        match self {
+            NetworkConfig::Bert(c) => BertModel::load(vb, c).map(Network::Bert),
+            NetworkConfig::NomicBert(c) => NomicBertModel::load(vb, c).map(Network::NomicBert),
+            NetworkConfig::Qwen3(c) => qwen3::Model::load(vb, c).map(Network::Qwen3),
+        }
+    }
+}
+
+/// A sentence-transformers model on candle, with its tokenizer, prompts and pooling.
 pub struct CandleEncoder {
-    model: BertModel,
+    model: Network,
     tokenizer: Tokenizer,
     device: Device,
     prompt: String,
@@ -71,30 +208,25 @@ impl CandleEncoder {
     /// Hugging Face cache under a model of the [`models`](super::models) list, eg. bge-small-en-v1.5, the prompts that
     /// the list holds fill in what its settings leave out. A missing file keeps its `NotFound`, a damaged one gives
     /// `InvalidData`, as does a listed prompt that its settings give otherwise. Settings this encoder can't follow, eg.
-    /// an extra dense layer after the pooling, give `Unsupported`, as does Metal where it isn't available.
+    /// a model type it has no network for or an extra dense layer after the pooling, give `Unsupported`, as does Metal
+    /// where it isn't available. The weights load in f32 whatever their stored precision, eg. bfloat16 for
+    /// Qwen3-Embedding-0.6B.
     pub fn open(snapshot: &Path, backend: Backend) -> Result<CandleEncoder, Error> {
-        let config: Config = read_json(&snapshot.join("config.json"))?;
+        let config = NetworkConfig::read(&snapshot.join("config.json"))?;
         let listed = match repo_of(snapshot) {
             Some(repo) => models::find(&repo)?,
             None => None,
         };
         let settings = Settings::read(snapshot, listed)?;
-
-        if config.num_hidden_layers == 0
-            || config.num_attention_heads == 0
-            || !config.hidden_size.is_multiple_of(config.num_attention_heads)
-        {
-            return Err(damaged("config.json has a shape no BERT model has"));
-        }
-
+        let shape = config.shape()?;
         let device = match backend {
             Backend::Cpu => Device::Cpu,
             Backend::Metal => Device::new_metal(0).map_err(|e| Error::new(ErrorKind::Unsupported, e.to_string()))?,
         };
-        let max_len = settings.max_len.unwrap_or(config.max_position_embeddings);
+        let max_len = settings.max_len.unwrap_or(shape.positions);
         let tokenizer = read_tokenizer(
             &snapshot.join("tokenizer.json"),
-            max_len.min(config.max_position_embeddings),
+            max_len.min(shape.positions),
             settings.lowercase,
         )?;
 
@@ -102,13 +234,13 @@ impl CandleEncoder {
         // every token the tokenizer knows, its added tokens too, needs a row, even where the ids leave gaps.
         let largest = tokenizer.get_vocab(true).into_values().max();
 
-        if largest.is_some_and(|id| id as usize >= config.vocab_size) {
+        if largest.is_some_and(|id| id as usize >= shape.vocab) {
             return Err(damaged("tokenizer.json has a token id past config.json's vocabulary"));
         }
 
         let weights = std::fs::read(snapshot.join("model.safetensors"))?;
         let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device).map_err(damaged)?;
-        let model = BertModel::load(vb, &config).map_err(damaged)?;
+        let model = config.load(vb).map_err(damaged)?;
         Ok(CandleEncoder {
             model,
             tokenizer,
@@ -116,9 +248,9 @@ impl CandleEncoder {
             prompt: settings.query,
             passage_prompt: settings.passage,
             pooling: settings.pooling,
-            dim: config.hidden_size,
-            layers: config.num_hidden_layers,
-            positions: config.max_position_embeddings,
+            dim: shape.dim,
+            layers: shape.layers,
+            positions: shape.positions,
         })
     }
 
@@ -197,15 +329,16 @@ impl CandleEncoder {
         let token_type_ids = Tensor::new(encoding.get_type_ids(), &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(model_failure)?;
+        let last = self.model.causal();
         let mut observe = |layer: usize, state: &Tensor| -> candle_core::Result<()> {
             if hook.wants(layer) {
-                let pooled = summary(state)?.to_vec1::<f32>()?;
+                let pooled = summary(state, last)?.to_vec1::<f32>()?;
                 hook.on_layer(layer, &pooled);
             }
             Ok(())
         };
         self.model
-            .forward_layers(&input_ids, &token_type_ids, None, layers, &mut observe)
+            .forward_layers(&input_ids, &token_type_ids, layers, &mut observe)
             .map_err(model_failure)
     }
 
@@ -215,6 +348,7 @@ impl CandleEncoder {
         let pooled = match self.pooling {
             Pooling::Cls => state.i((0, 0)),
             Pooling::Mean => state.mean(1).and_then(|m| m.squeeze(0)),
+            Pooling::LastToken => state.dim(1).and_then(|tokens| state.i((0, tokens.saturating_sub(1)))),
         };
         let mut embedding = pooled.and_then(|p| p.to_vec1::<f32>()).map_err(model_failure)?;
         let norm = embedding
@@ -246,11 +380,15 @@ impl LayerEncoder for CandleEncoder {
     }
 }
 
-/// concat(average over the tokens, first token) of a state shaped (1, tokens, d), as 2d values.
-fn summary(state: &Tensor) -> candle_core::Result<Tensor> {
+/// concat(average over the tokens, pooling token) of a state shaped (1, tokens, d), as 2d values. The pooling token is
+/// the first token, or with `last` the last one.
+fn summary(state: &Tensor, last: bool) -> candle_core::Result<Tensor> {
     let mean = state.mean(1)?;
-    let first = state.i((.., 0))?;
-    Tensor::cat(&[&mean, &first], 1)?.squeeze(0)
+    let token = match last {
+        true => state.i((.., state.dim(1)?.saturating_sub(1)))?,
+        false => state.i((.., 0))?,
+    };
+    Tensor::cat(&[&mean, &token], 1)?.squeeze(0)
 }
 
 /// The snapshot directory of the Hugging Face model `repo`, eg. "Snowflake/snowflake-arctic-embed-m-v1.5", in the
@@ -407,14 +545,20 @@ impl Settings {
         )?;
         let others = config.pooling_mode_max_tokens
             || config.pooling_mode_mean_sqrt_len_tokens
-            || config.pooling_mode_weightedmean_tokens
-            || config.pooling_mode_lasttoken;
-        let pooling = match (config.pooling_mode_cls_token, config.pooling_mode_mean_tokens, others) {
-            (true, false, false) => Pooling::Cls,
-            (false, true, false) => Pooling::Mean,
+            || config.pooling_mode_weightedmean_tokens;
+        let modes = (
+            config.pooling_mode_cls_token,
+            config.pooling_mode_mean_tokens,
+            config.pooling_mode_lasttoken,
+            others,
+        );
+        let pooling = match modes {
+            (true, false, false, false) => Pooling::Cls,
+            (false, true, false, false) => Pooling::Mean,
+            (false, false, true, false) => Pooling::LastToken,
             _ => {
                 return Err(unsupported(
-                    "a pooling other than the first token's state or the plain average",
+                    "a pooling other than the first token's state, the plain average or the last token's state",
                 ));
             }
         };

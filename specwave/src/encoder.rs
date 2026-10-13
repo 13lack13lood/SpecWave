@@ -1,12 +1,14 @@
 //! The embedding model, with a hook at chosen layers.
 //!
 //! Layer l is the state after l transformer layers, as in Hugging Face's `hidden_states[l]`. Layer 0 is the
-//! output of the embedding lookup. The first backend (feature `candle`) is `CandleEncoder`, which runs a copy of
-//! candle-transformers' BERT (Bidirectional Encoder Representations from Transformers) network in `encoder/bert.rs`.
-//! It calls the hook with layer 0 after the embedding lookup, and with layer i + 1 after transformer layer i. It
-//! summarizes the layer on the device and copies back only 2d floats, where d is the embedding size. It does this
-//! only for the layers the hook wants, so on the graphics processor (GPU, through Metal) a query waits for the
-//! device once. The [`models`] list names the models by short names and holds the settings their snapshots leave out.
+//! output of the embedding lookup. The first backend (feature `candle`) is `CandleEncoder`, which runs copies of
+//! candle-transformers' networks: BERT (Bidirectional Encoder Representations from Transformers) in `encoder/bert.rs`,
+//! NomicBERT in `encoder/nomic_bert.rs` and Qwen3 in `encoder/qwen3.rs`. It calls the hook with layer 0 after the
+//! embedding lookup, and with layer i + 1 after transformer layer i. Qwen3's last layer L comes after its final norm,
+//! as in `hidden_states[L]`. It summarizes the layer on the device and copies back only 2d floats, where d is the
+//! embedding size. It does this only for the layers the hook wants, so on the graphics processor (GPU, through Metal)
+//! a query waits for the device once. The [`models`] list names the models by short names and holds the settings
+//! their snapshots leave out.
 
 use std::io::Error;
 
@@ -15,6 +17,10 @@ mod bert;
 #[cfg(feature = "candle")]
 mod candle;
 pub mod models;
+#[cfg(feature = "candle")]
+mod nomic_bert;
+#[cfg(feature = "candle")]
+mod qwen3;
 
 #[cfg(feature = "candle")]
 pub use self::candle::{Backend, CandleEncoder, Pooling, snapshot_dir};
@@ -24,8 +30,9 @@ pub trait LayerHook {
     /// Whether `on_layer` wants this layer. The encoder asks once per layer, in order, as soon as the layer is done.
     /// On a device that queues its work, that is as soon as the layer's work is queued.
     fn wants(&self, layer: usize) -> bool;
-    /// `pooled` is the layer's summary of 2d values, the average over the tokens followed by the first token's state.
-    /// BERT-style models put a summary token there, the classification (CLS) token.
+    /// `pooled` is the layer's summary of 2d values, the average over the tokens followed by the pooling token's state.
+    /// That is the first token, where BERT-style models put a summary token, the classification (CLS) token. A causal
+    /// model, eg. Qwen3, takes the last token instead, since only the last token sees the whole text.
     fn on_layer(&mut self, layer: usize, pooled: &[f32]);
 }
 
@@ -35,7 +42,7 @@ pub trait LayerEncoder {
     fn dim(&self) -> usize;
     /// Runs the model on the query `text` and calls `hook` at the layers it wants. It returns the final normalized
     /// embedding. Each model pools and prompts its own way, eg. arctic-embed-m takes the CLS token with a query
-    /// prefix, and MiniLM the average over the tokens.
+    /// prefix, MiniLM the average over the tokens, and Qwen3-Embedding the last token with an instruction in front.
     fn encode(&mut self, text: &str, hook: &mut dyn LayerHook) -> Result<Vec<f32>, Error>;
     /// Whether the device queues the model's work and runs it later, eg. the GPU through Metal, rather than running
     /// each step as it is issued, as the processor does. The hook then hears of a layer before the layer has run.
